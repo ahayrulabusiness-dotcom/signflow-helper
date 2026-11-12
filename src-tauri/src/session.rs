@@ -521,7 +521,7 @@ async fn heartbeat(ctx: Arc<Ctx>, key: String, name: String, every: Duration, en
     let mut failing = false;
     loop {
         tokio::select! {
-            _ = stop.changed() => { if *stop.borrow() { return; } }
+            r = stop.changed() => { if r.is_err() || *stop.borrow() { return; } }
             _ = tokio::time::sleep(every) => {}
         }
         match ctx.api.heartbeat(&key).await {

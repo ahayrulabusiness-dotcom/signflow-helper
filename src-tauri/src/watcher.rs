@@ -106,7 +106,7 @@ pub async fn watch_file(path: PathBuf, known: String, timing: Timing, out: mpsc:
         // Wait for a sign of change: an event, or the periodic look.
         let mut dirty = false;
         tokio::select! {
-            _ = stop.changed() => { if *stop.borrow() { break; } }
+            r = stop.changed() => { if r.is_err() || *stop.borrow() { break; } }
             got = poke_rx.recv() => { if got.is_none() { break; } dirty = true; }
             _ = tokio::time::sleep(timing.poll) => { dirty = stamp(&path) != last_stamp; }
         }
@@ -118,7 +118,7 @@ pub async fn watch_file(path: PathBuf, known: String, timing: Timing, out: mpsc:
         let mut before = stamp(&path);
         loop {
             tokio::select! {
-                _ = stop.changed() => { if *stop.borrow() { return Ok(()); } }
+                r = stop.changed() => { if r.is_err() || *stop.borrow() { return Ok(()); } }
                 _ = tokio::time::sleep(timing.settle) => {}
             }
             while poke_rx.try_recv().is_ok() {}
