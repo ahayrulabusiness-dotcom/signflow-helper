@@ -1,0 +1,44 @@
+name: Publish a draft release
+
+# Publishes the existing DRAFT release named by the tag (publish-v0.1.1
+# publishes v0.1.1). It changes nothing else: the same files, checked by
+# name, size and SHA-256 before and after.
+
+on:
+  push:
+    tags: ["publish-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          v="${TAG#publish-}"
+          rel=$(gh api "repos/$REPO/releases?per_page=50" --jq "[.[] | select(.tag_name == \"$v\" and .draft == true)] | first")
+          if [ -z "$rel" ] || [ "$rel" = "null" ]; then
+            echo "::error title=no draft::There is no draft release for $v; nothing was published."
+            exit 1
+          fi
+          id=$(echo "$rel" | jq -r .id)
+          files='[.assets[] | "\(.name) \(.size) \(.digest)"] | sort | join("%0A")'
+          before=$(echo "$rel" | jq -r "$files")
+          echo "::notice title=draft files::$before"
+          gh api -X PATCH "repos/$REPO/releases/$id" -F draft=false -f make_latest=true > /dev/null
+          pub=$(gh api "repos/$REPO/releases/$id")
+          after=$(echo "$pub" | jq -r "$files")
+          echo "::notice title=published files::$after"
+          if [ "$before" != "$after" ]; then
+            echo "::error title=files differ::The published files aren't the draft's files."
+            exit 1
+          fi
+          echo "::notice title=published::$v is public: $(echo "$pub" | jq -r .html_url) (draft: $(echo "$pub" | jq -r .draft))"
