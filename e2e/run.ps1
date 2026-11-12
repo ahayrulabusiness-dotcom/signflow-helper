@@ -176,6 +176,13 @@ if ($wPath) {
   Admin replace-as @{ fileId = $wf.id; user = "dana"; content = (B64 $theirsW) } | Out-Null
   $mineW = Bytes "Carlee's version, answered in the window $(Get-Random)"
   SaveLikeFlexi $wPath $mineW
+  WaitFor { LogHas "stale window shown" } 60 | Out-Null
+  Start-Sleep -Seconds 3
+  $wv = (Get-CimInstance Win32_Process -Filter "Name = 'msedgewebview2.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -notmatch "--type=" } | ForEach-Object { $_.CommandLine }) -join "`n"
+  $port = try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://127.0.0.1:9223/json/version").Content } catch { "no answer: $($_.Exception.Message)" }
+  $diag = "browser: $wv`nport 9223: $port"
+  if ($diag.Length -gt 3500) { $diag = $diag.Substring(0, 3500) }
+  Write-Host "::notice title=WebView2 for the stale window::$(Esc $diag)"
   $clicked = (& node "$PSScriptRoot\click-stale.mjs" 9223 upload-mine-as-newest 2>&1 | Out-String).Trim()
   Write-Host $clicked
   Write-Host "::notice title=stale window click::$(Esc ($clicked.Substring(0, [Math]::Min(3500, $clicked.Length))))"

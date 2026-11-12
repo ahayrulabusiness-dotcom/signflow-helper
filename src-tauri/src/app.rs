@@ -115,7 +115,7 @@ impl Ui for TrayUi {
         // Built off the main thread (building a window inside an event
         // handler can deadlock on Windows).
         std::thread::spawn(move || {
-            let built = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("stale.html".into()))
+            let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("stale.html".into()))
                 .title("SignFlow Helper")
                 .inner_size(460.0, 400.0)
                 .resizable(false)
@@ -124,8 +124,12 @@ impl Ui for TrayUi {
                 .always_on_top(true)
                 .center()
                 .focused(true)
-                .initialization_script(format!("window.__STALE__ = {data};"))
-                .build();
+                .initialization_script(format!("window.__STALE__ = {data};"));
+            // The e2e build opens WebView2's debugging port so the run can
+            // click this window (wry's own defaults kept alongside).
+            #[cfg(feature = "e2e")]
+            let builder = builder.additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=9223");
+            let built = builder.build();
             match built {
                 Ok(window) => {
                     logfile::info(&format!("stale window shown ({label})"));
@@ -312,12 +316,6 @@ pub fn run() {
     if !config::endpoints_are_safe() {
         logfile::warn("refusing to run: built with an address that isn't HTTPS");
         return;
-    }
-    #[cfg(feature = "e2e")]
-    {
-        // Lets the e2e run click the stale window through WebView2's
-        // debugging port. Only the e2e build does this.
-        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--remote-debugging-port=9223");
     }
     tauri::Builder::default()
         // Must be first: a second launch (another link clicked) hands its
