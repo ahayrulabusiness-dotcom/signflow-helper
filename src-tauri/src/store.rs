@@ -1,5 +1,5 @@
 //! Where an opened file lives on her computer, and the helper's notes about
-//! it: %LOCALAPPDATA%\SignFlow Helper\files\<file id>\<file name>, beside a
+//! it: %LOCALAPPDATA%\SignFlow Helper Files\files\<file id>\<file name>, beside a
 //! notes file. The notes say which SignFlow version she has and what was last
 //! saved to SignFlow — never a pass, a key, a token or a link.
 //!
