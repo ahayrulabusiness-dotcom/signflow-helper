@@ -190,6 +190,7 @@ Remove-Item -Force "$work\opened.txt" -ErrorAction SilentlyContinue
 OpenLink (Admin pass @{ fileId = $big.id; user = "carlee" }).pass
 $bigPath = WaitFor { Opened } 90
 Check "the big file opened" ([bool]$bigPath) "$bigPath"
+if (-not $bigPath) { throw "the big file never opened, so the 500MB part couldn't run" }
 $proc = Get-Process | Where-Object { $_.Path -and $_.Path -like "$installDir\*" } | Select-Object -First 1
 $tmp = Join-Path (Split-Path $bigPath) "_Big_fs.tmp"
 $fs = [IO.File]::Create($tmp)
@@ -240,7 +241,19 @@ $md | Out-File -Encoding utf8 (Join-Path $work "summary.md")
 function Esc([string]$t) { $t.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A") }
 $lines = ($results | ForEach-Object { "$(if ($_.ok) { 'ok  ' } else { 'FAIL' }) $($_.name) | $($_.detail)" }) -join "`n"
 Write-Host "::notice title=e2e results ($($results.Count - $failed.Count)/$($results.Count))::$(Esc $lines)"
-foreach ($r in ($failed | Select-Object -First 9)) { Write-Host "::error title=e2e FAIL::$(Esc "$($r.name) | $($r.detail)")" }
+foreach ($r in ($failed | Select-Object -First 7)) { Write-Host "::error title=e2e FAIL::$(Esc "$($r.name) | $($r.detail)")" }
+# What the helper and the stand-in saw (progress lines left out), readable
+# without signing in.
+if (Test-Path $log) {
+  $hl = (Get-Content $log | Where-Object { $_ -notmatch "STATUS (Downloading|Saving) .* \d+%" } | Select-Object -Last 150) -join "`n"
+  Write-Host "::notice title=helper.log (last 150 lines)::$(Esc $hl)"
+}
+try {
+  $ev = ((State).events | ForEach-Object { "$([DateTimeOffset]::FromUnixTimeMilliseconds($_.at).ToString('HH:mm:ss.fff')) $($_.what) $($_.fileId) $($_.user)" } | Select-Object -Last 120) -join "`n"
+  Write-Host "::notice title=stand-in events (last 120)::$(Esc $ev)"
+} catch {}
+$so = ((Get-Content "$work\standin.out", "$work\standin.err" -ErrorAction SilentlyContinue) | Select-Object -Last 40) -join "`n"
+if ($so) { Write-Host "::notice title=stand-in output::$(Esc $so)" }
 if (Test-Path $log) { Copy-Item $log (Join-Path $work "helper.log") }
 Stop-Process -Id $standin.Id -ErrorAction SilentlyContinue
 Get-Process | Where-Object { $_.Path -and $_.Path -like "$installDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue

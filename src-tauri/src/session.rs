@@ -447,6 +447,7 @@ async fn upload_and_replace(ctx: &Ctx, key: &str, snap: &Path, name: &str, mut c
                         continue;
                     }
                     None => {
+                        log::info("save: stale question closed without a choice");
                         ui.status(&format!("Editing {name} — {} saved a newer version; not saved yet", q.who()));
                         return SaveOutcome::Waiting;
                     }
@@ -494,6 +495,7 @@ fn local_notes(ctx: &Ctx, notes: &Notes) -> std::io::Result<()> {
 }
 
 fn api_trouble(ctx: &Ctx, e: ApiError) -> SaveOutcome {
+    log::warn(&format!("save: SignFlow answered {e:?}"));
     if e.is_retryable() {
         ctx.ui.status("Can't reach SignFlow — your file is safe here; trying again");
         return SaveOutcome::Retry;

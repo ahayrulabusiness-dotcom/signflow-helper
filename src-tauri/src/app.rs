@@ -92,8 +92,9 @@ impl Ui for TrayUi {
             // file out and clicks the real window instead.
             let f = config::home_dir().join("e2e-choice.txt");
             if let Ok(text) = std::fs::read_to_string(&f) {
-                logfile::info(&format!("ASK answered by the test: {}", text.trim()));
-                let _ = tx.send(Choice::parse(text.trim()));
+                let text = text.trim_start_matches('\u{feff}').trim();
+                logfile::info(&format!("ASK answered by the test: {text}"));
+                let _ = tx.send(Choice::parse(text));
                 return rx;
             }
         }
