@@ -46,8 +46,11 @@ jobs:
           cargo test --color never -- --nocapture --test-threads 1 2>&1 | Tee-Object -FilePath ../unit-tests.log
           $code = $LASTEXITCODE
           $passed = (Select-String -Path ../unit-tests.log -Pattern '^test result: ok\. (\d+) passed' -AllMatches).Matches | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Sum
-          $watch = (Select-String -Path ../unit-tests.log -Pattern '^\[watcher\]').Line -join "%0A"
-          Write-Host "::notice title=unit tests::exit $code, $($passed.Sum) passed%0A$watch"
+          # With --nocapture a test's printout can share a line with its name.
+          $watch = (Select-String -Path ../unit-tests.log -Pattern '\[watcher\].*$').Matches | ForEach-Object { $_.Value }
+          $names = cargo test --color never -q -- --list 2>$null | Where-Object { $_ -match ': test$' } | ForEach-Object { $_ -replace ': test$', '' }
+          Write-Host "::notice title=unit tests::exit $code, $($passed.Sum) passed%0A%0Asave watcher against a fake editor:%0A$($watch -join '%0A')"
+          Write-Host "::notice title=unit test names::$($names -join '%0A')"
           if ($code -ne 0) {
             $tail = (Get-Content ../unit-tests.log | Select-String -Pattern 'error|panicked|FAILED|failures|assert' | Select-Object -Last 40 | ForEach-Object { $_.Line }) -join "%0A"
             Write-Host "::error title=unit tests failed::$tail"
