@@ -1,9 +1,9 @@
 name: Release
 
-# Makes a DRAFT release (not public) with the Windows installer and the
-# updater's signed update file. Run it by pushing a version tag (v0.1.0) or
-# with "Run workflow". The update-signing key comes only from the repository's
-# secret settings; nothing in this repository is a secret.
+# Makes a DRAFT release (not public) with the Windows installer, its update
+# signature and latest.json for the updater. Run it by pushing a version tag
+# (v0.1.0) or with "Run workflow". The update-signing key comes only from the
+# repository's secret settings; nothing in this repository is a secret.
 
 on:
   push:
@@ -12,6 +12,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -49,43 +53,72 @@ jobs:
             exit 1
           }
 
-      - name: Check the signing key is set up
+      - name: Build the installer and sign the update
         env:
           KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          if (-not $env:KEY -or -not $env:PASSWORD) {
+          # Pasted secrets can pick up a space or line break at either end;
+          # the key and password themselves never have one.
+          $key = "$env:KEY".Trim()
+          $password = "$env:PASSWORD".Trim()
+          if (-not $key -or -not $password) {
             Write-Host "::error title=signing key missing::Add TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD in Settings > Secrets and variables > Actions."
             exit 1
           }
+          # Its shape only, never its contents: the key file is base64 of a
+          # minisign "untrusted comment" block.
+          $shape = try { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($key)).StartsWith("untrusted comment:") } catch { $false }
+          if (-not $shape) {
+            Write-Host "::error title=signing key unreadable::TAURI_SIGNING_PRIVATE_KEY isn't the whole contents of TAURI_SIGNING_PRIVATE_KEY.txt. Paste it again (all of it, nothing else)."
+            exit 1
+          }
+          $env:TAURI_SIGNING_PRIVATE_KEY = $key
+          $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $password
+          npx tauri build --bundles nsis 2>&1 | Tee-Object -FilePath build-release.log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = (Get-Content build-release.log | Where-Object { $_ -match 'error|failed|Error|wrong|password|key' } | Select-Object -Last 15) -join "%0A"
+            Write-Host "::error title=release build failed::$tail"
+            exit 1
+          }
 
-      - name: Build and make a draft release
-        id: tauri
-        # v1.0.0, pinned to its commit
-        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+      - name: Make the draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: v__VERSION__
-          releaseName: SignFlow Helper v__VERSION__
-          releaseBody: Windows installer for the SignFlow Helper. Draft — not published.
-          releaseDraft: true
-          prerelease: false
-          uploadUpdaterJson: true
-          tauriScript: npx tauri
-          args: --bundles nsis
-
-      - name: Report the installer
-        env:
-          PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $paths = $env:PATHS | ConvertFrom-Json
-          foreach ($p in $paths) {
-            if (Test-Path $p) {
-              $f = Get-Item $p
-              Write-Host "::notice title=release file::$($f.Name), $([math]::Round($f.Length / 1MB, 2)) MB ($($f.Length) bytes)"
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $tag = "v$v"
+          $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${v}_x64-setup.exe" | Select-Object -First 1
+          $sig = Get-Item "$($setup.FullName).sig"
+          # A name without spaces, so the download link is the file's name.
+          $name = "SignFlow-Helper_${v}_x64-setup.exe"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $setup.FullName "dist/$name"
+          Copy-Item $sig.FullName "dist/$name.sig"
+          $latest = [ordered]@{
+            version = $v
+            notes = "SignFlow Helper $v"
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content $sig.FullName -Raw).Trim()
+                url = "https://github.com/${{ github.repository }}/releases/download/$tag/$name"
+              }
             }
           }
-          Write-Host "::notice title=draft release::${{ steps.tauri.outputs.releaseHtmlUrl }} (draft, not public)"
+          $latest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM dist/latest.json
+
+          $existing = gh release view $tag --json isDraft 2>$null | ConvertFrom-Json
+          if ($existing -and -not $existing.isDraft) {
+            Write-Host "::error title=already published::$tag is already a published release; it is left alone. Raise the version to make a new one."
+            exit 1
+          }
+          if ($existing) {
+            gh release upload $tag "dist/$name" "dist/$name.sig" dist/latest.json --clobber
+          } else {
+            gh release create $tag "dist/$name" "dist/$name.sig" dist/latest.json --draft --target "${{ github.sha }}" --title "SignFlow Helper $tag" --notes "Windows 11 installer for the SignFlow Helper. Draft: not published, not public."
+          }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=release failed::gh couldn't make the draft release."; exit 1 }
+          $f = Get-Item "dist/$name"
+          Write-Host "::notice title=release file::$name, $([math]::Round($f.Length / 1MB, 2)) MB ($($f.Length) bytes); built as $($setup.Name)"
+          Write-Host "::notice title=draft release::$tag (draft, not public): $(gh release view $tag --json url --jq .url)"

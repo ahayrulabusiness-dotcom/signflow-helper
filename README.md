@@ -40,8 +40,9 @@ Windows user only and with no admin prompt, into
   released.
 - **Release**: push a tag `v<version>` (the version in
   `src-tauri/tauri.conf.json`), or use "Run workflow". It makes a **draft**
-  release with the installer, its `.sig` and `latest.json` for the updater.
-  A draft isn't public until someone publishes it.
+  release with the installer (`SignFlow-Helper_<version>_x64-setup.exe`), its
+  `.sig` and `latest.json` for the updater. A draft isn't public until someone
+  publishes it; a version that is already published is never touched.
 
 ## Update signing
 
