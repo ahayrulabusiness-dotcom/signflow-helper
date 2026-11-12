@@ -170,8 +170,8 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
                 return Ended::CouldNotStart("file in use".into());
             }
             match download(&ctx, &key, &local, &name).await {
-                Ok(hash) => {
-                    notes = Notes { file_id: ex.file.id.clone(), file_name: name.clone(), base_version: ex.file.version.clone(), saved_hash: hash };
+                Ok((hash, version)) => {
+                    notes = Notes { file_id: ex.file.id.clone(), file_name: name.clone(), base_version: version, saved_hash: hash };
                     let _ = local.write_notes(&notes);
                 }
                 Err(msg) => {
@@ -285,8 +285,9 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
     ended
 }
 
-/// Downloads the file into place; its fingerprint. Never over unsaved work.
-async fn download(ctx: &Ctx, key: &str, local: &Local, name: &str) -> Result<String, String> {
+/// Downloads the file into place; its fingerprint and SignFlow's version
+/// tag for what was downloaded. Never over unsaved work.
+async fn download(ctx: &Ctx, key: &str, local: &Local, name: &str) -> Result<(String, String), String> {
     let mut tries = 0;
     loop {
         let attempt = async {
@@ -313,10 +314,10 @@ async fn download(ctx: &Ctx, key: &str, local: &Local, name: &str) -> Result<Str
             })?;
             let p = local.path.clone();
             let (hash, _) = tokio::task::spawn_blocking(move || watcher::fingerprint(&p)).await.map_err(|e| (false, e.to_string()))?.map_err(|e| (false, e.to_string()))?;
-            Ok::<String, (bool, String)>(hash)
+            Ok::<(String, String), (bool, String)>((hash, link.version.clone()))
         };
         match attempt.await {
-            Ok(hash) => return Ok(hash),
+            Ok(got) => return Ok(got),
             Err((true, _)) if tries < 4 => {
                 tries += 1;
                 tokio::time::sleep(ctx.retry_after).await;
@@ -472,8 +473,9 @@ async fn keep_theirs_first(ctx: &Ctx, key: &str, local: &Local, name: &str, note
         return SaveOutcome::Ended(Ended::KeptTheirs);
     }
     match download(ctx, key, local, name).await {
-        Ok(hash) => {
+        Ok((hash, version)) => {
             notes.saved_hash = hash;
+            notes.base_version = version;
             let _ = local_notes(ctx, notes);
             *pending = None;
             ui.tell(&format!("Opened their version of {name}. Your version is kept beside it as {}.", aside.file_name().unwrap_or_default().to_string_lossy()));

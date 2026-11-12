@@ -3,6 +3,9 @@
 // on), checks the words, and clicks one choice. Prints what it saw as JSON.
 //   node e2e/click-stale.mjs <port> <choice>
 import { chromium } from "playwright-core";
+// Whatever happens, say it as one JSON line the run can read.
+process.on("uncaughtException", (e) => { console.log(JSON.stringify({ error: String(e?.message || e).split("\n")[0] })); process.exit(0); });
+process.on("unhandledRejection", (e) => { console.log(JSON.stringify({ error: String(e?.message || e).split("\n")[0] })); process.exit(0); });
 const [port = "9223", choice = "upload-mine-as-newest"] = process.argv.slice(2);
 const deadline = Date.now() + 90_000;
 let browser;

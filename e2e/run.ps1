@@ -27,6 +27,7 @@ function WaitFor([scriptblock]$cond, [int]$seconds) {
   }
   return $null
 }
+function Esc([string]$t) { $t.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A") }
 function Sha([byte[]]$bytes) { ([Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join "" }
 function FileSha([string]$path) { (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower() }
 function B64([byte[]]$bytes) { [Convert]::ToBase64String($bytes) }
@@ -42,6 +43,8 @@ $log = Join-Path $data "helper.log"
 function LogHas([string]$text) { (Test-Path $log) -and ((Get-Content $log -Raw) -like "*$text*") }
 function Opened { if (Test-Path "$work\opened.txt") { (Get-Content "$work\opened.txt" | Where-Object { $_ } | Select-Object -Last 1) } }
 function OpenLink([string]$pass) { Start-Process "signflow-edit://open?pass=$pass" }
+# A note for the e2e build in its folder (an answer, or "done"), plain UTF-8.
+function Tell([string]$text, [string]$file) { [IO.File]::WriteAllText((Join-Path $data $file), $text, [Text.UTF8Encoding]::new($false)) }
 function FileRow([string]$id) { (State).files | Where-Object { $_.id -eq $id } }
 function EditOf([string]$id) { (State).edits | Where-Object { $_.fileId -eq $id } | Select-Object -Last 1 }
 
@@ -105,7 +108,7 @@ foreach ($choice in @("upload-mine-as-newest", "save-mine-as-copy", "keep-theirs
   $theirs = Bytes "Dana's version before $choice"
   $r = Admin replace-as @{ fileId = $f.id; user = "dana"; content = (B64 $theirs) }
   Check "${choice}: Dana could replace it while the lock had lapsed" $r.ok
-  [IO.File]::WriteAllText((Join-Path $data "e2e-choice.txt"), $choice, [Text.UTF8Encoding]::new($false))
+  Tell $choice "e2e-choice.txt"
   Check "${choice}: the test's answer file is in place" (Test-Path (Join-Path $data "e2e-choice.txt")) (Join-Path $data "e2e-choice.txt")
   $mine = Bytes "Carlee's version for $choice $(Get-Random)"
   SaveLikeFlexi $opened $mine
@@ -123,6 +126,7 @@ foreach ($choice in @("upload-mine-as-newest", "save-mine-as-copy", "keep-theirs
     $closed = WaitFor { $e = EditOf $f.id; if (-not $e.open) { $e } } 30
     Check "keep theirs: the edit ends" ([bool]$closed) "$($closed.closedReason)"
     Check "keep theirs: her file on this computer is untouched" ((FileSha $opened) -eq (Sha $mine))
+    $keptMine = Sha $mine
   }
   Check "${choice}: the stale question named Dana" (LogHas "ASK Concept.fs by Dana")
 }
@@ -137,42 +141,61 @@ $events = (State).events.Count
 Start-Process "signflow-edit://open?pass=short&url=https://evil.example"
 Check "a malformed link is refused without calling SignFlow" ([bool](WaitFor { LogHas "LINK refused" } 30) -and (State).events.Count -eq $events)
 
-# ---- The stale window itself, clicked like a person would (WebView2's
-# debugging port, which only the e2e build opens)
-Remove-Item -Force (Join-Path $data "e2e-choice.txt") -ErrorAction SilentlyContinue
-$passW = (Admin pass @{ fileId = $f.id; user = "carlee" }).pass
-OpenLink $passW
-$openW = WaitFor { $e = EditOf $f.id; if ($e.open) { $e } } 60
-Check "window: opened again (her kept-theirs copy moved aside first)" ([bool]$openW)
-Admin lapse @{ fileId = $f.id } | Out-Null
-$theirsW = Bytes "Dana's version before the window"
-Admin replace-as @{ fileId = $f.id; user = "dana"; content = (B64 $theirsW) } | Out-Null
-$mineW = Bytes "Carlee's version, answered in the window $(Get-Random)"
-SaveLikeFlexi $opened $mineW
-$clicked = & node "$PSScriptRoot\click-stale.mjs" 9223 upload-mine-as-newest 2>&1 | Out-String
-Write-Host $clicked
-$seen = $null
-try { $seen = ($clicked.Trim() -split "`n" | Where-Object { $_ -like "{*" } | Select-Object -Last 1) | ConvertFrom-Json } catch {}
-Check "window: the stale window opened and named Dana" ($seen -and $seen.title -eq "Dana saved a newer version" -and $seen.lead -like "*Concept.fs*") "$($seen.title) / $($seen.lead)"
-Check "window: three choices in plain words" ($seen -and (($seen.buttons -join "|") -eq "Keep theirs|Upload mine as the newest|Save mine as a copy")) "$($seen.buttons -join ' | ')"
-$okW = WaitFor { $x = FileRow $f.id; if ($x.sha256 -eq (Sha $mineW)) { $x } } 60
-Check "window: clicking 'Upload mine as the newest' uploads hers; Dana's kept as a version" ($okW -and $okW.versions[0] -eq (Sha $theirsW))
-Check "window: the answer came from the window, not a test file" (LogHas "ASK answered in the window: upload-mine-as-newest")
-Set-Content -NoNewline (Join-Path $data "e2e-control.txt") "done"
-$doneW = WaitFor { $e = EditOf $f.id; if (-not $e.open) { $e } } 60
-Check "window: Done ends that edit" ([bool]$doneW)
-
-# ---- The lock: a second person can't open it; Done ends it
+# ---- Reopening after "keep theirs": her changed copy is moved aside (never
+# deleted) and SignFlow's version opens in its place
+Tell "keep-theirs" "e2e-choice.txt"
 $pass2 = (Admin pass @{ fileId = $f.id; user = "carlee" }).pass
 OpenLink $pass2
 $open2 = WaitFor { $e = EditOf $f.id; if ($e.open) { $e } } 60
 Check "opened again from a new link" ([bool]$open2)
+$theirsNow = (FileRow $f.id).sha256
+$fresh = WaitFor { if ((Test-Path $opened) -and (FileSha $opened) -eq $theirsNow) { $true } } 60
+Check "reopened with her unsaved changes: SignFlow's version is what opens" ([bool]$fresh)
+$aside = Get-ChildItem (Split-Path $opened) -Filter "Concept (not in SignFlow, *).fs" -ErrorAction SilentlyContinue | Select-Object -First 1
+Check "…and her changed copy is kept beside it, not deleted" ($aside -and (FileSha $aside.FullName) -eq $keptMine) "$($aside.Name)"
+Remove-Item -Force (Join-Path $data "e2e-choice.txt") -ErrorAction SilentlyContinue
+
+# ---- The lock: a second person can't open it; Done ends it
 $danaTry = try { Admin pass @{ fileId = $f.id; user = "dana" }; $false } catch { $_.Exception.Response.StatusCode.value__ -eq 409 }
 Check "while Carlee edits, Dana can't open it too" $danaTry
-Set-Content -NoNewline (Join-Path $data "e2e-control.txt") "done"
+Tell "done" "e2e-control.txt"
 $done = WaitFor { $e = EditOf $f.id; if (-not $e.open) { $e } } 60
-Check "Done ends the edit and the lock" ($done -and $done.closedReason -eq "done") "$($done.closedReason)"
+Check "Done (from the tray) ends the edit and the lock" ($done -and $done.closedReason -eq "done") "$($done.closedReason)"
 Check "her file is still on this computer after Done" (Test-Path $opened)
+
+# ---- The stale window itself, clicked like a person would (WebView2's
+# debugging port, which only the e2e build opens), on a file of its own
+$wf = Admin file @{ name = "Window.fs"; content = (B64 (Bytes "Window file, version 1")) }
+Remove-Item -Force "$work\opened.txt" -ErrorAction SilentlyContinue
+OpenLink (Admin pass @{ fileId = $wf.id; user = "carlee" }).pass
+$wPath = WaitFor { $o = Opened; if ($o -like "*Window.fs") { $o } } 90
+Check "window: a second file opened" ([bool]$wPath) "$wPath"
+if ($wPath) {
+  Admin lapse @{ fileId = $wf.id } | Out-Null
+  $theirsW = Bytes "Dana's version before the window"
+  Admin replace-as @{ fileId = $wf.id; user = "dana"; content = (B64 $theirsW) } | Out-Null
+  $mineW = Bytes "Carlee's version, answered in the window $(Get-Random)"
+  SaveLikeFlexi $wPath $mineW
+  $clicked = (& node "$PSScriptRoot\click-stale.mjs" 9223 upload-mine-as-newest 2>&1 | Out-String).Trim()
+  Write-Host $clicked
+  Write-Host "::notice title=stale window click::$(Esc ($clicked.Substring(0, [Math]::Min(3500, $clicked.Length))))"
+  $seen = $null
+  try { $seen = ($clicked -split "`n" | Where-Object { $_ -like "{*" } | Select-Object -Last 1) | ConvertFrom-Json } catch {}
+  Check "window: the stale window opened and named Dana" ($seen -and $seen.title -eq "Dana saved a newer version" -and $seen.lead -like "*Window.fs*") "$($seen.title) / $($seen.lead) $($seen.error)"
+  Check "window: three choices in plain words" ($seen -and (($seen.buttons -join "|") -eq "Keep theirs|Upload mine as the newest|Save mine as a copy")) "$($seen.buttons -join ' | ')"
+  $okW = WaitFor { $x = FileRow $wf.id; if ($x.sha256 -eq (Sha $mineW)) { $x } } 60
+  if (-not $okW) {
+    # The click didn't land: answer through the file so the rest can run.
+    Tell "upload-mine-as-newest" "e2e-choice.txt"
+    WaitFor { $x = FileRow $wf.id; if ($x.sha256 -eq (Sha $mineW)) { $x } } 30 | Out-Null
+    Remove-Item -Force (Join-Path $data "e2e-choice.txt") -ErrorAction SilentlyContinue
+  }
+  Check "window: clicking 'Upload mine as the newest' uploads hers; Dana's kept as a version" ($okW -and $okW.versions[0] -eq (Sha $theirsW))
+  Check "window: the answer came from the window, not a test file" (LogHas "ASK answered in the window: upload-mine-as-newest")
+  Tell "done" "e2e-control.txt"
+  $doneW = WaitFor { $e = EditOf $wf.id; if (-not $e.open) { $e } } 60
+  Check "window: Done ends that edit" ([bool]$doneW)
+}
 
 # ---- An account turned off mid-session is refused at once
 $pass3 = (Admin pass @{ fileId = $f.id; user = "carlee" }).pass
@@ -221,7 +244,7 @@ Check "a 500MB save arrives whole (SHA-256 matches)" ([bool]$arrived) "$([math]:
 Check "the helper never held the file in memory (peak under 150MB)" ($peakMB -lt 150) "working set at start $([math]::Round($startWs / 1MB, 1)) MB, peak during upload $peakMB MB, lifetime peak $peakLifeMB MB"
 Check "it went in parts" ([bool]((State).events | Where-Object { $_.what -eq "blob multipart" -and $_.size -eq 524288000 }))
 Check "the tray reported upload progress" (LogHas "STATUS Saving Big.fs to SignFlow")
-Set-Content -NoNewline (Join-Path $data "e2e-control.txt") "done"
+Tell "done" "e2e-control.txt"
 
 # ---- Never anything but the one file
 $uploads = (State).events | Where-Object { $_.what -like "blob*" }
@@ -237,24 +260,31 @@ $failed = @($results | Where-Object { -not $_.ok })
 $md = "## Helper end-to-end on Windows`n`n| | Check | Detail |`n|---|---|---|`n" + (($results | ForEach-Object { "| $(if ($_.ok) { '✅' } else { '❌' }) | $($_.name) | $($_.detail -replace '\|', '/') |" }) -join "`n")
 if ($env:GITHUB_STEP_SUMMARY) { $md | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY }
 $md | Out-File -Encoding utf8 (Join-Path $work "summary.md")
-# One annotation with every result (readable without signing in), and the
-# failures on their own (GitHub keeps 10 of each kind per step).
-function Esc([string]$t) { $t.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A") }
-$lines = ($results | ForEach-Object { "$(if ($_.ok) { 'ok  ' } else { 'FAIL' }) $($_.name) | $($_.detail)" }) -join "`n"
-Write-Host "::notice title=e2e results ($($results.Count - $failed.Count)/$($results.Count))::$(Esc $lines)"
+# Notes readable without signing in: every result, the failures on their
+# own (GitHub keeps 10 of each kind per step), the helper's log and the
+# stand-in's events. GitHub keeps about 4KB of each note, so long text goes in pieces (the
+# newest pieces when there are too many).
+function Notice([string]$title, [string[]]$lines, [int]$max) {
+  $chunks = [System.Collections.ArrayList]::new(); $cur = ""
+  foreach ($l in $lines) {
+    if (($cur.Length + $l.Length + 1) -gt 3600 -and $cur) { [void]$chunks.Add($cur); $cur = "" }
+    $cur += "$l`n"
+  }
+  if ($cur) { [void]$chunks.Add($cur) }
+  $from = [Math]::Max(0, $chunks.Count - $max)
+  for ($i = $from; $i -lt $chunks.Count; $i++) { Write-Host "::notice title=$title ($($i + 1)/$($chunks.Count))::$(Esc $chunks[$i].TrimEnd())" }
+}
+Notice "e2e results $($results.Count - $failed.Count)/$($results.Count)" ($results | ForEach-Object { "$(if ($_.ok) { 'ok  ' } else { 'FAIL' }) $($_.name) | $($_.detail)" }) 2
 foreach ($r in ($failed | Select-Object -First 7)) { Write-Host "::error title=e2e FAIL::$(Esc "$($r.name) | $($r.detail)")" }
-# What the helper and the stand-in saw (progress lines left out), readable
-# without signing in.
+# What the helper and the stand-in saw (progress lines and check-ins left out).
 if (Test-Path $log) {
-  $hl = (Get-Content $log | Where-Object { $_ -notmatch "STATUS (Downloading|Saving) .* \d+%" } | Select-Object -Last 150) -join "`n"
-  Write-Host "::notice title=helper.log (last 150 lines)::$(Esc $hl)"
+  Notice "helper.log" (Get-Content $log | Where-Object { $_ -notmatch "STATUS (Downloading|Saving) .* \d+%" } | ForEach-Object { $_ -replace "^\d{4}-\d\d-\d\dT(\d\d:\d\d:\d\d\.\d+)\+0000 ", '$1 ' }) 4
 }
 try {
-  $ev = ((State).events | ForEach-Object { "$([DateTimeOffset]::FromUnixTimeMilliseconds($_.at).ToString('HH:mm:ss.fff')) $($_.what) $($_.fileId) $($_.user)" } | Select-Object -Last 120) -join "`n"
-  Write-Host "::notice title=stand-in events (last 120)::$(Esc $ev)"
+  Notice "stand-in events" ((State).events | Where-Object { $_.what -ne "heartbeat" } | ForEach-Object { "$([DateTimeOffset]::FromUnixTimeMilliseconds($_.at).ToString('HH:mm:ss.fff')) $($_.what) $($_.fileId) $($_.user)" }) 1
 } catch {}
-$so = ((Get-Content "$work\standin.out", "$work\standin.err" -ErrorAction SilentlyContinue) | Select-Object -Last 40) -join "`n"
-if ($so) { Write-Host "::notice title=stand-in output::$(Esc $so)" }
+$so = (Get-Content "$work\standin.out", "$work\standin.err" -ErrorAction SilentlyContinue) | Select-Object -Last 30
+if ($so) { Notice "stand-in output" $so 1 }
 if (Test-Path $log) { Copy-Item $log (Join-Path $work "helper.log") }
 Stop-Process -Id $standin.Id -ErrorAction SilentlyContinue
 Get-Process | Where-Object { $_.Path -and $_.Path -like "$installDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue

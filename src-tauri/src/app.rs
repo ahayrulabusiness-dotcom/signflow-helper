@@ -129,6 +129,32 @@ impl Ui for TrayUi {
             match built {
                 Ok(window) => {
                     logfile::info(&format!("stale window shown ({label})"));
+                    #[cfg(feature = "e2e")]
+                    {
+                        // The e2e run may still answer through the file (if
+                        // its click didn't land), so a test can't hang here.
+                        let app3 = app.clone();
+                        let mine = label.clone();
+                        std::thread::spawn(move || {
+                            let f = config::home_dir().join("e2e-choice.txt");
+                            for _ in 0..1200 {
+                                std::thread::sleep(Duration::from_millis(500));
+                                let waiting = app3.state::<Shared>().answer.lock().unwrap().as_ref().map(|(l, _)| l == &mine).unwrap_or(false);
+                                if !waiting {
+                                    return;
+                                }
+                                if let Ok(bytes) = std::fs::read(&f) {
+                                    let text = String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').trim().to_string();
+                                    logfile::info(&format!("ASK answered by the test (late): {text}"));
+                                    answer(&app3, &mine, Choice::parse(&text));
+                                    if let Some(w) = app3.get_webview_window(&mine) {
+                                        let _ = w.close();
+                                    }
+                                    return;
+                                }
+                            }
+                        });
+                    }
                     let app2 = app.clone();
                     let mine = label.clone();
                     window.on_window_event(move |event| {
