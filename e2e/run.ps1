@@ -105,7 +105,8 @@ foreach ($choice in @("upload-mine-as-newest", "save-mine-as-copy", "keep-theirs
   $theirs = Bytes "Dana's version before $choice"
   $r = Admin replace-as @{ fileId = $f.id; user = "dana"; content = (B64 $theirs) }
   Check "${choice}: Dana could replace it while the lock had lapsed" $r.ok
-  Set-Content -NoNewline (Join-Path $data "e2e-choice.txt") $choice
+  [IO.File]::WriteAllText((Join-Path $data "e2e-choice.txt"), $choice, [Text.UTF8Encoding]::new($false))
+  Check "${choice}: the test's answer file is in place" (Test-Path (Join-Path $data "e2e-choice.txt")) (Join-Path $data "e2e-choice.txt")
   $mine = Bytes "Carlee's version for $choice $(Get-Random)"
   SaveLikeFlexi $opened $mine
   if ($choice -eq "upload-mine-as-newest") {

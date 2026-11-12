@@ -91,11 +91,15 @@ impl Ui for TrayUi {
             // The e2e run answers through a file; one part of it leaves the
             // file out and clicks the real window instead.
             let f = config::home_dir().join("e2e-choice.txt");
-            if let Ok(text) = std::fs::read_to_string(&f) {
-                let text = text.trim_start_matches('\u{feff}').trim();
-                logfile::info(&format!("ASK answered by the test: {text}"));
-                let _ = tx.send(Choice::parse(text));
-                return rx;
+            match std::fs::read(&f) {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let text = text.trim_start_matches('\u{feff}').trim();
+                    logfile::info(&format!("ASK answered by the test: {text}"));
+                    let _ = tx.send(Choice::parse(text));
+                    return rx;
+                }
+                Err(e) => logfile::info(&format!("ASK: no test answer at {} ({e}); showing the window", f.display())),
             }
         }
         let shared = self.app.state::<Shared>();
@@ -124,6 +128,7 @@ impl Ui for TrayUi {
                 .build();
             match built {
                 Ok(window) => {
+                    logfile::info(&format!("stale window shown ({label})"));
                     let app2 = app.clone();
                     let mine = label.clone();
                     window.on_window_event(move |event| {
