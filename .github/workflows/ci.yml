@@ -1,0 +1,108 @@
+name: CI
+
+# Every push and pull request: the tests, an end-to-end run of an installed
+# e2e build against a throwaway stand-in on the runner, and a build of the
+# release installer. Needs no secret; nothing is published.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install the Tauri CLI
+        run: npm ci
+
+      - name: Unit tests (links, API client, uploads, save watcher)
+        working-directory: src-tauri
+        run: |
+          cargo test --color never -- --nocapture --test-threads 1 2>&1 | Tee-Object -FilePath ../unit-tests.log
+          $code = $LASTEXITCODE
+          $passed = (Select-String -Path ../unit-tests.log -Pattern '^test result: ok\. (\d+) passed' -AllMatches).Matches | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Sum
+          $watch = (Select-String -Path ../unit-tests.log -Pattern '^\[watcher\]').Line -join "%0A"
+          Write-Host "::notice title=unit tests::exit $code, $($passed.Sum) passed%0A$watch"
+          if ($code -ne 0) {
+            $tail = (Get-Content ../unit-tests.log | Select-String -Pattern 'error|panicked|FAILED|failures|assert' | Select-Object -Last 40 | ForEach-Object { $_.Line }) -join "%0A"
+            Write-Host "::error title=unit tests failed::$tail"
+            exit $code
+          }
+
+      - name: Unit tests with the e2e build's settings
+        working-directory: src-tauri
+        run: |
+          cargo test --color never --features e2e -- --test-threads 1 2>&1 | Tee-Object -FilePath ../unit-tests-e2e.log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = (Get-Content ../unit-tests-e2e.log | Select-Object -Last 40) -join "%0A"
+            Write-Host "::error title=unit tests (e2e features) failed::$tail"
+            exit 1
+          }
+
+      - name: Build the e2e installer (talks to the stand-in on 127.0.0.1)
+        env:
+          SIGNFLOW_HELPER_BASE_URL: http://127.0.0.1:4700
+          SIGNFLOW_HELPER_BLOB_API_URL: http://127.0.0.1:4701/api/blob
+        run: |
+          npx tauri build --features e2e --bundles nsis --config e2e/tauri.e2e.conf.json 2>&1 | Tee-Object -FilePath build-e2e.log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = (Get-Content build-e2e.log | Select-String -Pattern 'error' -Context 0,6 | Select-Object -Last 12 | ForEach-Object { $_.ToString() }) -join "%0A"
+            Write-Host "::error title=e2e build failed::$tail"
+            exit 1
+          }
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          Copy-Item $setup.FullName e2e-setup.exe
+
+      - name: End-to-end on Windows (install, links, saves, stale choices, 500MB)
+        run: |
+          npm install --no-save --prefix e2e playwright-core@1.49.1
+          ./e2e/run.ps1 -Installer (Resolve-Path e2e-setup.exe).Path
+
+      - name: Build the release installer
+        run: |
+          npx tauri build --bundles nsis --config e2e/tauri.ci-release.conf.json 2>&1 | Tee-Object -FilePath build-release.log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = (Get-Content build-release.log | Select-String -Pattern 'error' -Context 0,6 | Select-Object -Last 12 | ForEach-Object { $_.ToString() }) -join "%0A"
+            Write-Host "::error title=release build failed::$tail"
+            exit 1
+          }
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          Write-Host "::notice title=release installer::$($setup.Name), $([math]::Round($setup.Length / 1MB, 2)) MB ($($setup.Length) bytes)"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-logs
+          path: |
+            unit-tests*.log
+            build-*.log
+            e2e/work/summary.md
+            e2e/work/helper.log
+            e2e/work/standin.*
+          if-no-files-found: ignore

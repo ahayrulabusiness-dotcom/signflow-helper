@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SignFlow Helper</title>
+<link rel="stylesheet" href="stale.css">
+</head>
+<body>
+<main>
+  <h1 id="title">Someone saved a newer version</h1>
+  <p id="lead">Someone saved a newer version of this file in SignFlow after you opened it. What should happen to your changes?</p>
+  <div class="choices">
+    <button class="choice" data-choice="keep-theirs"><b>Keep theirs</b><span>Their version stays in SignFlow. Your changes stay on this computer only.</span></button>
+    <button class="choice" data-choice="upload-mine-as-newest"><b>Upload mine as the newest</b><span>Your version becomes the file in SignFlow. Theirs is kept as an older version.</span></button>
+    <button class="choice" data-choice="save-mine-as-copy"><b>Save mine as a copy</b><span>Your version is added beside theirs as a copy. Theirs stays the file.</span></button>
+  </div>
+  <button class="later" data-choice="">Not now</button>
+</main>
+<script src="stale.js"></script>
+</body>
+</html>

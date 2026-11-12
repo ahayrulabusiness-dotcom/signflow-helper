@@ -1,0 +1,49 @@
+[package]
+name = "signflow-helper"
+version = "0.1.0"
+description = "Opens SignFlow files in Flexi and saves them back"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+# One binary, no library target: see src/main.rs.
+
+[features]
+# The e2e build: may download from the local stand-in over http://127.0.0.1,
+# answers the stale question from a file, takes Done from a file, and opens a
+# WebView2 debugging port. Never used for an installer anyone gets.
+e2e = []
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dependencies]
+tauri = { version = "2.12.5", features = ["tray-icon"] }
+tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
+tauri-plugin-deep-link = "2.6.3"
+tauri-plugin-opener = "2.7.3"
+tauri-plugin-dialog = "2.8.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2"] }
+futures-util = "0.3.34"
+bytes = "1.12.1"
+url = "2.5.8"
+percent-encoding = "2.3.2"
+notify = "8.2.1"
+sha2 = "0.10"
+hex = "0.4.3"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+axum = "0.8.9"
+tempfile = "3.27.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "unwind"
+strip = true

@@ -1,0 +1,91 @@
+name: Release
+
+# Makes a DRAFT release (not public) with the Windows installer and the
+# updater's signed update file. Run it by pushing a version tag (v0.1.0) or
+# with "Run workflow". The update-signing key comes only from the repository's
+# secret settings; nothing in this repository is a secret.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install the Tauri CLI
+        run: npm ci
+
+      - name: Tests first
+        working-directory: src-tauri
+        run: cargo test --color never -- --test-threads 1
+
+      - name: Check the tag matches the app's version
+        if: github.ref_type == 'tag'
+        run: |
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("${{ github.ref_name }}" -ne "v$v") {
+            Write-Host "::error title=version mismatch::The tag is ${{ github.ref_name }} but src-tauri/tauri.conf.json says $v. Change the version there (and in src-tauri/Cargo.toml and package.json), then tag v<that version>."
+            exit 1
+          }
+
+      - name: Check the signing key is set up
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:KEY -or -not $env:PASSWORD) {
+            Write-Host "::error title=signing key missing::Add TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD in Settings > Secrets and variables > Actions."
+            exit 1
+          }
+
+      - name: Build and make a draft release
+        id: tauri
+        # v1.0.0, pinned to its commit
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: SignFlow Helper v__VERSION__
+          releaseBody: Windows installer for the SignFlow Helper. Draft — not published.
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          tauriScript: npx tauri
+          args: --bundles nsis
+
+      - name: Report the installer
+        env:
+          PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          $paths = $env:PATHS | ConvertFrom-Json
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              $f = Get-Item $p
+              Write-Host "::notice title=release file::$($f.Name), $([math]::Round($f.Length / 1MB, 2)) MB ($($f.Length) bytes)"
+            }
+          }
+          Write-Host "::notice title=draft release::${{ steps.tauri.outputs.releaseHtmlUrl }} (draft, not public)"

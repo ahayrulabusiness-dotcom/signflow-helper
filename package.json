@@ -1,0 +1,12 @@
+{
+  "name": "signflow-helper",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The SignFlow Helper: opens SignFlow files in Flexi and saves them back (Windows 11).",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4"
+  }
+}
