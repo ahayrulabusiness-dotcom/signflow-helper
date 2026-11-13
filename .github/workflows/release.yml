@@ -1,9 +1,11 @@
 name: Release
 
-# Makes a DRAFT release (not public) with the Windows installer, its update
-# signature and latest.json for the updater. Run it by pushing a version tag
-# (v0.1.0) or with "Run workflow". The update-signing key comes only from the
-# repository's secret settings; nothing in this repository is a secret.
+# Makes a DRAFT release (not public) with the Windows installer, the macOS
+# .dmg (universal: Apple Silicon and Intel), each platform's signed update and
+# one latest.json that serves both. Run it by pushing a version tag (v0.1.2)
+# or with "Run workflow". The update-signing key comes only from the
+# repository's secret settings and signs both platforms' updates; nothing in
+# this repository is a secret.
 
 on:
   push:
@@ -18,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  windows:
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
@@ -78,47 +80,146 @@ jobs:
           npx tauri build --bundles nsis 2>&1 | Tee-Object -FilePath build-release.log
           if ($LASTEXITCODE -ne 0) {
             $tail = (Get-Content build-release.log | Where-Object { $_ -match 'error|failed|Error|wrong|password|key' } | Select-Object -Last 15) -join "%0A"
-            Write-Host "::error title=release build failed::$tail"
+            Write-Host "::error title=Windows release build failed::$tail"
             exit 1
           }
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${v}_x64-setup.exe" | Select-Object -First 1
+          New-Item -ItemType Directory -Force dist | Out-Null
+          # Names without spaces, so each download link is the file's name.
+          Copy-Item $setup.FullName "dist/SignFlow-Helper_${v}_x64-setup.exe"
+          Copy-Item "$($setup.FullName).sig" "dist/SignFlow-Helper_${v}_x64-setup.exe.sig"
 
-      - name: Make the draft release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-windows
+          path: dist/
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install the Tauri CLI
+        run: npm ci
+
+      - name: Tests first
+        working-directory: src-tauri
+        run: cargo test --color never -- --test-threads 1
+
+      - name: Build the universal app, .dmg and signed update
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          # The key is one line of base64 and the password has no spaces, so
+          # dropping all whitespace only removes what pasting added.
+          key=$(printf %s "$KEY" | tr -d '[:space:]')
+          password=$(printf %s "$PASSWORD" | tr -d '[:space:]')
+          if [ -z "$key" ] || [ -z "$password" ]; then
+            echo "::error title=signing key missing::Add TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [ "$(printf %s "$key" | base64 -D 2>/dev/null | head -c 18)" != "untrusted comment:" ]; then
+            echo "::error title=signing key unreadable::TAURI_SIGNING_PRIVATE_KEY isn't the whole contents of TAURI_SIGNING_PRIVATE_KEY.txt. Paste it again (all of it, nothing else)."
+            exit 1
+          fi
+          export TAURI_SIGNING_PRIVATE_KEY="$key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$password"
+          set +e
+          npx tauri build --target universal-apple-darwin --bundles app,dmg 2>&1 | tee build-release-mac.log
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" != "0" ]; then
+            tail=$(grep -E 'error|failed|Error|wrong|password|key' build-release-mac.log | tail -15 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=macOS release build failed::$tail"
+            exit 1
+          fi
+          v=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          B=src-tauri/target/universal-apple-darwin/release/bundle
+          app="$B/macos/SignFlow Helper.app"
+          lipo -archs "$app/Contents/MacOS/signflow-helper" | grep -q x86_64 && lipo -archs "$app/Contents/MacOS/signflow-helper" | grep -q arm64 || { echo "::error title=not universal::$(lipo -archs "$app/Contents/MacOS/signflow-helper")"; exit 1; }
+          codesign --verify --deep --strict "$app" || { echo "::error title=signature does not verify::"; exit 1; }
+          mkdir -p dist
+          cp "$(ls $B/dmg/*.dmg | head -1)" "dist/SignFlow-Helper_${v}_universal.dmg"
+          cp "$B/macos/SignFlow Helper.app.tar.gz" "dist/SignFlow-Helper_${v}_universal.app.tar.gz"
+          cp "$B/macos/SignFlow Helper.app.tar.gz.sig" "dist/SignFlow-Helper_${v}_universal.app.tar.gz.sig"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-macos
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: One latest.json for both platforms, and the draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
-          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $tag = "v$v"
-          $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${v}_x64-setup.exe" | Select-Object -First 1
-          $sig = Get-Item "$($setup.FullName).sig"
-          # A name without spaces, so the download link is the file's name.
-          $name = "SignFlow-Helper_${v}_x64-setup.exe"
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item $setup.FullName "dist/$name"
-          Copy-Item $sig.FullName "dist/$name.sig"
-          $latest = [ordered]@{
-            version = $v
-            notes = "SignFlow Helper $v"
-            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            platforms = [ordered]@{
-              "windows-x86_64" = [ordered]@{
-                signature = (Get-Content $sig.FullName -Raw).Trim()
-                url = "https://github.com/${{ github.repository }}/releases/download/$tag/$name"
-              }
-            }
-          }
-          $latest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM dist/latest.json
-
-          $existing = gh release view $tag --json isDraft 2>$null | ConvertFrom-Json
-          if ($existing -and -not $existing.isDraft) {
-            Write-Host "::error title=already published::$tag is already a published release; it is left alone. Raise the version to make a new one."
+          set -euo pipefail
+          v=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          tag="v$v"
+          base="https://github.com/$REPO/releases/download/$tag"
+          # The updater picks its entry by platform: Windows by
+          # windows-x86_64, a Mac by darwin-aarch64 (Apple Silicon) or
+          # darwin-x86_64 (Intel). The universal update serves both Macs.
+          V="$v" BASE="$base" node -e '
+            const fs = require("fs");
+            const v = process.env.V, base = process.env.BASE;
+            const sig = (f) => fs.readFileSync(`dist/${f}.sig`, "utf8").trim();
+            const exe = `SignFlow-Helper_${v}_x64-setup.exe`, mac = `SignFlow-Helper_${v}_universal.app.tar.gz`;
+            const latest = {
+              version: v,
+              notes: `SignFlow Helper ${v}`,
+              pub_date: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+              platforms: {
+                "windows-x86_64": { signature: sig(exe), url: `${base}/${exe}` },
+                "darwin-aarch64": { signature: sig(mac), url: `${base}/${mac}` },
+                "darwin-x86_64": { signature: sig(mac), url: `${base}/${mac}` },
+              },
+            };
+            fs.writeFileSync("dist/latest.json", JSON.stringify(latest, null, 2) + "\n");
+          '
+          ls -l dist
+          files=(dist/*)
+          existing=$(gh release view "$tag" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [ "$existing" = "false" ]; then
+            echo "::error title=already published::$tag is already a published release; it is left alone. Raise the version to make a new one."
             exit 1
-          }
-          if ($existing) {
-            gh release upload $tag "dist/$name" "dist/$name.sig" dist/latest.json --clobber
-          } else {
-            gh release create $tag "dist/$name" "dist/$name.sig" dist/latest.json --draft --target "${{ github.sha }}" --title "SignFlow Helper $tag" --notes "Windows 11 installer for the SignFlow Helper. Draft: not published, not public."
-          }
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=release failed::gh couldn't make the draft release."; exit 1 }
-          $f = Get-Item "dist/$name"
-          Write-Host "::notice title=release file::$name, $([math]::Round($f.Length / 1MB, 2)) MB ($($f.Length) bytes); built as $($setup.Name)"
-          Write-Host "::notice title=draft release::$tag (draft, not public): $(gh release view $tag --json url --jq .url)"
+          elif [ "$existing" = "true" ]; then
+            gh release upload "$tag" "${files[@]}" --repo "$REPO" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --repo "$REPO" --draft --target "$SHA" --title "SignFlow Helper $tag" --notes "Windows 11 installer and macOS app (Apple Silicon and Intel) for the SignFlow Helper. Draft: not published, not public."
+          fi
+          for f in dist/*; do echo "::notice title=release file::$(basename "$f"), $(stat -c%s "$f") bytes"; done
+          echo "::notice title=draft release::$tag (draft, not public): $(gh release view "$tag" --repo "$REPO" --json url --jq .url)"

@@ -73,7 +73,21 @@ pub fn released(path: &Path) -> bool {
     std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path).is_ok()
 }
 
-#[cfg(not(windows))]
+/// macOS has no share modes, so ask lsof whether any program has the file
+/// open for writing ("w") or reading and writing ("u"). If lsof can't run,
+/// the settle period alone decides.
+#[cfg(target_os = "macos")]
+pub fn released(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    match std::process::Command::new("/usr/sbin/lsof").args(["-F", "a", "--"]).arg(path).output() {
+        Ok(out) => !String::from_utf8_lossy(&out.stdout).lines().any(|l| l == "aw" || l == "au"),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn released(path: &Path) -> bool {
     path.exists()
 }
@@ -242,6 +256,38 @@ mod tests {
         let got = next(&mut r.rx, Duration::from_secs(10)).await.expect("noticed");
         println!("[watcher] held open for {} ms: nothing sent while open; noticed {} ms after it was let go", released_at.as_millis(), (held.elapsed() - released_at).as_millis());
         assert_eq!(got.hash, hash_of(b"version 2, still open"));
+        r.stop.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_mac_style_save_into_a_hidden_temp_file_then_rename() {
+        // How macOS apps usually save: a hidden temporary beside the file (or
+        // in a temporary folder), then a rename over the original.
+        let mut r = rig(b"version 1").await;
+        let started = Instant::now();
+        let tmp = r.path.with_file_name(".Concept.fs.sb-1a2b3c4d-XyZ123");
+        std::fs::write(&tmp, b"version 2, saved the Mac way").unwrap();
+        std::fs::rename(&tmp, &r.path).unwrap();
+        let got = next(&mut r.rx, Duration::from_secs(10)).await.expect("noticed");
+        println!("[watcher] hidden temp file then rename (Mac): noticed {} ms after the rename", started.elapsed().as_millis());
+        assert_eq!(got.hash, hash_of(b"version 2, saved the Mac way"));
+        assert!(next(&mut r.rx, Duration::from_secs(2)).await.is_none(), "once");
+        r.stop.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ds_store_and_tilde_files_are_ignored() {
+        let mut r = rig(b"version 1").await;
+        let dir = r.path.parent().unwrap().to_path_buf();
+        std::fs::write(dir.join(".DS_Store"), b"Finder's notes").unwrap();
+        std::fs::write(dir.join("Concept.fs~"), b"an editor's backup").unwrap();
+        std::fs::write(dir.join("~$Concept.fs"), b"an owner file").unwrap();
+        std::fs::write(dir.join("~Concept.fs.tmp"), b"a scratch file").unwrap();
+        assert!(next(&mut r.rx, Duration::from_secs(4)).await.is_none(), ".DS_Store and ~ files are not saves");
+        std::fs::write(&r.path, b"version 2").unwrap();
+        let got = next(&mut r.rx, Duration::from_secs(10)).await.expect("the real save is still noticed");
+        assert_eq!(got.hash, hash_of(b"version 2"));
+        println!("[watcher] .DS_Store and ~ files beside it: ignored; the real save was noticed");
         r.stop.send(true).unwrap();
     }
 

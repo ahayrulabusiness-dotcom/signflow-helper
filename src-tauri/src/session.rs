@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::api::{Api, ApiError, Choice, Exchange, Saved, StaleInfo};
 use crate::blob::{BlobClient, BlobError, Progress};
+use crate::config::words;
 use crate::logfile as log;
 use crate::store::{self, Local, Notes, Start};
 use crate::watcher::{self, Settled, Timing};
@@ -166,7 +167,7 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
             if start == Start::Refresh && !watcher::released(&local.path) {
                 let _ = ctx.api.done(&key).await;
                 ui.status("Not editing");
-                ui.tell(&format!("A newer version of {name} is in SignFlow. Close {name} in Flexi, then open it again from SignFlow."));
+                ui.tell(&format!("A newer version of {name} is in SignFlow. Close {name}{}, then open it again from SignFlow.", words::IN_EDITOR));
                 return Ended::CouldNotStart("file in use".into());
             }
             match download(&ctx, &key, &local, &name).await {
@@ -193,7 +194,9 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
     if let Err(e) = (ctx.open)(&local.path) {
         log::warn(&format!("session: couldn't open the file: {e}"));
         ui.tell(&format!(
-            "Windows couldn't open {name}. Make sure Flexi is installed and set as the program for .fs files. Your file is here: {}",
+            "{} couldn't open {name}. {} Your file is here: {}",
+            words::COMPUTER,
+            words::SET_UP_EDITOR,
             local.path.display()
         ));
     }
@@ -240,7 +243,7 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
                 break Ended::EndedBySignFlow(msg);
             }
             c = control.recv() => match c {
-                Some(Control::OpenFile) => { if let Err(e) = (ctx.open)(&local.path) { ui.tell(&format!("Windows couldn't open {name}: {e}")); } }
+                Some(Control::OpenFile) => { if let Err(e) = (ctx.open)(&local.path) { ui.tell(&format!("{} couldn't open {name}: {e}", words::COMPUTER)); } }
                 Some(Control::ShowFolder) => { let _ = (ctx.reveal)(&local.path); }
                 Some(Control::Done) | None => {
                     // A last save, if there is one.
@@ -310,7 +313,7 @@ async fn download(ctx: &Ctx, key: &str, local: &Local, name: &str) -> Result<(St
             }
             std::fs::rename(&tmp, &local.path).map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);
-                (false, format!("The helper couldn't put {name} in its folder ({e}). Close it in Flexi and open it again from SignFlow."))
+                (false, format!("The helper couldn't put {name} in its folder ({e}). Close it{} and open it again from SignFlow.", words::IN_EDITOR))
             })?;
             let p = local.path.clone();
             let (hash, _) = tokio::task::spawn_blocking(move || watcher::fingerprint(&p)).await.map_err(|e| (false, e.to_string()))?.map_err(|e| (false, e.to_string()))?;
@@ -433,7 +436,8 @@ async fn upload_and_replace(ctx: &Ctx, key: &str, snap: &Path, name: &str, mut c
             Ok(Saved::KeptTheirs { .. }) => {
                 *pending = None;
                 ui.tell(&format!(
-                    "Kept their version of {name} in SignFlow. Your changes are still in {name} on this computer. To work on their version, close {name} in Flexi, then open it again from SignFlow."
+                    "Kept their version of {name} in SignFlow. Your changes are still in {name} on this computer. To work on their version, close {name}{}, then open it again from SignFlow.",
+                    words::IN_EDITOR
                 ));
                 ui.status("Not editing");
                 log::info("save: kept theirs");
@@ -464,12 +468,12 @@ async fn upload_and_replace(ctx: &Ctx, key: &str, snap: &Path, name: &str, mut c
 async fn keep_theirs_first(ctx: &Ctx, key: &str, local: &Local, name: &str, notes: &mut Notes, pending: &mut Option<String>) -> SaveOutcome {
     let ui = ctx.ui.clone();
     if !watcher::released(&local.path) {
-        ui.tell(&format!("Close {name} in Flexi first, then open it again from SignFlow to get their version. Your file hasn't been changed."));
+        ui.tell(&format!("Close {name}{} first, then open it again from SignFlow to get their version. Your file hasn't been changed.", words::IN_EDITOR));
         return SaveOutcome::Ended(Ended::KeptTheirs);
     }
     let aside = local.aside_name(&stamp_for_name());
     if std::fs::rename(&local.path, &aside).is_err() {
-        ui.tell(&format!("Close {name} in Flexi first, then open it again from SignFlow to get their version. Your file hasn't been changed."));
+        ui.tell(&format!("Close {name}{} first, then open it again from SignFlow to get their version. Your file hasn't been changed.", words::IN_EDITOR));
         return SaveOutcome::Ended(Ended::KeptTheirs);
     }
     match download(ctx, key, local, name).await {

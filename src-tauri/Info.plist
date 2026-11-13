@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the macOS app's own Info.plist by Tauri's bundler.
+     LSUIElement: a menu-bar app from launch (no Dock icon, no app menu).
+     CFBundleURLTypes: signflow-edit:// links open this app. -->
+<plist version="1.0">
+<dict>
+  <key>LSUIElement</key>
+  <true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>com.signflow.helper</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>signflow-edit</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

@@ -125,9 +125,9 @@ impl Ui for TrayUi {
                 .center()
                 .focused(true)
                 .initialization_script(format!("window.__STALE__ = {data};"));
-            // The e2e build opens WebView2's debugging port so the run can
-            // click this window (wry's own defaults kept alongside).
-            #[cfg(feature = "e2e")]
+            // The Windows e2e build opens WebView2's debugging port so the run
+            // can click this window (wry's own defaults kept alongside).
+            #[cfg(all(feature = "e2e", windows))]
             let builder = builder.additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=9223");
             let built = builder.build();
             match built {
@@ -244,7 +244,7 @@ fn start_session(app: &AppHandle, pass: String) {
     if current.is_some() {
         drop(current);
         logfile::warn("LINK while an edit is open: asked to finish it first");
-        ui_of(app).tell("You're already editing a file. Click Done in the SignFlow Helper menu (by the clock), then open the other file again from SignFlow.");
+        ui_of(app).tell(&format!("You're already editing a file. Click Done in the SignFlow Helper menu ({}), then open the other file again from SignFlow.", config::words::MENU_PLACE));
         return;
     }
     let (tx, rx) = mpsc::channel(8);
@@ -303,6 +303,13 @@ fn build_tray(app: &tauri::App) -> tauri::Result<Items> {
             }
             _ => {}
         });
+    // macOS: a black-and-clear "template" picture that the menu bar tints for
+    // light and dark. Windows: the app's own icon by the clock.
+    #[cfg(target_os = "macos")]
+    {
+        tray = tray.icon(tauri::include_image!("./icons/menubar-template.png")).icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
     }
@@ -327,6 +334,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![answer_stale])
         .setup(|app| {
+            // A menu-bar app on macOS: no Dock icon, no app menu (Info.plist's
+            // LSUIElement says the same from launch).
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let handle = app.handle().clone();
             let items = match build_tray(app) {
                 Ok(items) => Some(items),

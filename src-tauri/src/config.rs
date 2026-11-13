@@ -34,11 +34,39 @@ pub const MAX_FILE_BYTES: u64 = 500 * 1024 * 1024;
 /// The links the helper answers to.
 pub const LINK_SCHEME: &str = "signflow-edit";
 
+/// Words that differ by computer. Windows keeps its wording exactly; a Mac
+/// has no Flexi, so the file opens in whatever app the Mac uses for it.
+pub mod words {
+    #[cfg(target_os = "macos")]
+    pub const IN_EDITOR: &str = "";
+    #[cfg(not(target_os = "macos"))]
+    pub const IN_EDITOR: &str = " in Flexi";
+    #[cfg(target_os = "macos")]
+    pub const COMPUTER: &str = "Your Mac";
+    #[cfg(not(target_os = "macos"))]
+    pub const COMPUTER: &str = "Windows";
+    #[cfg(target_os = "macos")]
+    pub const SET_UP_EDITOR: &str = "Make sure an app on this Mac is set to open .fs files.";
+    #[cfg(not(target_os = "macos"))]
+    pub const SET_UP_EDITOR: &str = "Make sure Flexi is installed and set as the program for .fs files.";
+    #[cfg(target_os = "macos")]
+    pub const MENU_PLACE: &str = "in the menu bar";
+    #[cfg(not(target_os = "macos"))]
+    pub const MENU_PLACE: &str = "by the clock";
+}
+
 /// The helper's own folder for the files it opens, its log and its notes
-/// about each file (never a key or a token): %LOCALAPPDATA%\SignFlow Helper
-/// Files. Deliberately NOT the install folder (%LOCALAPPDATA%\SignFlow
-/// Helper), so uninstalling can never take her files with it.
+/// about each file (never a key or a token). Deliberately NOT where the app
+/// is installed, so uninstalling can never take her files with it:
+///   Windows: %LOCALAPPDATA%\SignFlow Helper Files (the app is in
+///            %LOCALAPPDATA%\SignFlow Helper)
+///   macOS:   ~/Library/Application Support/SignFlow Helper Files (the app is
+///            in /Applications)
 pub fn home_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(home).join("Library/Application Support/SignFlow Helper Files");
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);

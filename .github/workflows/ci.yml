@@ -1,12 +1,13 @@
 name: CI
 
-# Every push and pull request: the tests, an end-to-end run of an installed
-# e2e build against a throwaway stand-in on the runner, and a build of the
-# release installer. Needs no secret; nothing is published.
+# Every push and pull request, on Windows and on macOS: the tests, an
+# end-to-end run of an installed e2e build against a throwaway stand-in on the
+# runner, and a build of the release installer (.exe; universal .dmg). Needs
+# no secret; nothing is published.
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
@@ -107,5 +108,104 @@ jobs:
             build-*.log
             e2e/work/summary.md
             e2e/work/helper.log
+            e2e/work/standin.*
+          if-no-files-found: ignore
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install the Tauri CLI
+        run: npm ci
+
+      - name: Unit tests on macOS (links, API client, uploads, save watcher)
+        working-directory: src-tauri
+        run: |
+          set +e
+          cargo test --color never -- --nocapture --test-threads 1 2>&1 | tee ../unit-tests-mac.log
+          code=${PIPESTATUS[0]}
+          set -e
+          passed=$(grep -Eo '^test result: ok\. [0-9]+ passed' ../unit-tests-mac.log | grep -Eo '[0-9]+' | paste -sd+ - | bc)
+          watch=$(grep -Eo '\[watcher\].*$' ../unit-tests-mac.log | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::notice title=macOS unit tests::exit $code, ${passed:-0} passed%0A%0Asave watcher against a fake editor:%0A$watch"
+          if [ "$code" != "0" ]; then
+            tail=$(grep -E 'error|panicked|FAILED|failures|assert' ../unit-tests-mac.log | tail -40 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=macOS unit tests failed::$tail"
+            exit "$code"
+          fi
+
+      - name: Unit tests with the e2e build's settings (macOS)
+        working-directory: src-tauri
+        run: cargo test --color never --features e2e -- --test-threads 1
+
+      - name: Build the e2e app and .dmg (talks to the stand-in on 127.0.0.1)
+        env:
+          SIGNFLOW_HELPER_BASE_URL: http://127.0.0.1:4700
+          SIGNFLOW_HELPER_BLOB_API_URL: http://127.0.0.1:4701/api/blob
+        run: |
+          set +e
+          npx tauri build --features e2e --bundles app,dmg --config e2e/tauri.e2e.conf.json 2>&1 | tee build-e2e-mac.log
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" != "0" ]; then
+            tail=$(grep -E -A6 'error|Error' build-e2e-mac.log | tail -30 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=macOS e2e build failed::$tail"
+            exit 1
+          fi
+          dmg=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          cp "$dmg" e2e-mac.dmg
+          echo "::notice title=macOS e2e build::$(basename "$dmg"), $(stat -f%z "$dmg") bytes"
+
+      - name: End-to-end on macOS (install from .dmg, links with open, saves, stale, Done)
+        run: node e2e/run-mac.mjs "$PWD/e2e-mac.dmg"
+
+      - name: Build the universal release app and .dmg (Apple Silicon + Intel)
+        run: |
+          set +e
+          npx tauri build --target universal-apple-darwin --bundles app,dmg --config e2e/tauri.ci-release.conf.json 2>&1 | tee build-release-mac.log
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" != "0" ]; then
+            tail=$(grep -E -A6 'error|Error' build-release-mac.log | tail -30 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=macOS release build failed::$tail"
+            exit 1
+          fi
+          B=src-tauri/target/universal-apple-darwin/release/bundle
+          dmg=$(ls $B/dmg/*.dmg | head -1)
+          app="$B/macos/SignFlow Helper.app"
+          archs=$(lipo -archs "$app/Contents/MacOS/signflow-helper")
+          sig=$(codesign -dv --verbose=2 "$app" 2>&1 | grep -E '^(Signature|Identifier|CodeDirectory)' | tr '\n' ' ')
+          codesign --verify --deep --strict "$app" && verified=yes || verified=no
+          echo "::notice title=macOS release build::$(basename "$dmg"), $(stat -f%z "$dmg") bytes%0Aarchitectures: $archs%0A$sig%0Acodesign --verify --deep --strict: $verified"
+          case "$archs" in *x86_64*arm64*|*arm64*x86_64*) ;; *) echo "::error title=not universal::$archs"; exit 1;; esac
+          [ "$verified" = yes ] || { echo "::error title=signature does not verify::$sig"; exit 1; }
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-logs-mac
+          path: |
+            unit-tests-mac.log
+            build-*-mac.log
+            e2e/work/summary-mac.md
+            e2e/work/helper-mac.log
             e2e/work/standin.*
           if-no-files-found: ignore
