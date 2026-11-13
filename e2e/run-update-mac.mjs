@@ -142,7 +142,7 @@ try {
   markNow();
   await control("check-auto");
   check("a newer version found by the automatic check", await waitLog(`UPDATE found ${next}`, 30));
-  check("…opens the update window by itself", await waitLog("UPDATE window shown", 30));
+  check("…opens the update window by itself", (await waitLog("UPDATE window shown", 30)) && (await waitLog("UPDATE window open", 30)));
   check(`window: 'SignFlow Edit ${next} is available'`, await waitFor(() => windowSays(`SignFlow Edit ${next} is available`, `You have version ${current}.`), 10));
   check("menu bar: the dot is on", seen("UPDATE dot on"));
   check(`menu: 'Update to ${next}'`, seen(`UPDATE menu: Update to ${next}`));

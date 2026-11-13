@@ -563,8 +563,13 @@ pub fn run() {
                                 "update" => start_update(&h),
                                 "not-now" => {
                                     snooze(&h);
-                                    if let Some(w) = h.get_webview_window(UPDATE_WINDOW) {
-                                        let _ = w.close();
+                                    // The window may still be on its way.
+                                    for _ in 0..20 {
+                                        if let Some(w) = h.get_webview_window(UPDATE_WINDOW) {
+                                            let _ = w.close();
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
                                     }
                                 }
                                 _ => {}
@@ -955,6 +960,7 @@ fn show_update_window(app: &AppHandle) {
         let builder = builder.additional_browser_args(E2E_WEBVIEW_ARGS);
         match builder.build() {
             Ok(window) => {
+                logfile::info("UPDATE window open");
                 let app2 = app.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Destroyed = event {
