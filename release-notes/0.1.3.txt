@@ -1,0 +1,2 @@
+SignFlow Edit now keeps itself up to date.
+When a new version is out, it tells you once and you choose when to update. It never updates while a file is open.

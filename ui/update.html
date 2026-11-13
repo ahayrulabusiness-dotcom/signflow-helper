@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SignFlow Edit update</title>
+<link rel="stylesheet" href="update.css">
+</head>
+<body>
+<main>
+  <h1 id="title"></h1>
+  <p id="message" role="status"></p>
+  <div id="bar" class="bar" role="progressbar" aria-label="Download" aria-valuemin="0" aria-valuemax="100" hidden><div id="fill"></div></div>
+  <section id="notes-box" class="notes" aria-labelledby="notes-heading" hidden>
+    <h2 id="notes-heading">What's new</h2>
+    <p id="notes"></p>
+  </section>
+  <div class="buttons">
+    <button id="secondary" class="secondary" hidden></button>
+    <button id="primary" class="primary" hidden></button>
+  </div>
+</main>
+<script src="update.js"></script>
+</body>
+</html>

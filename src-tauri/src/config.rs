@@ -3,7 +3,7 @@
 //! file or a server answer can change where the helper talks to or uploads.
 //!
 //! The release build uses the defaults below. The end-to-end test build sets
-//! the two `SIGNFLOW_HELPER_*` variables at build time to a throwaway local
+//! the `SIGNFLOW_HELPER_*` variables at build time to a throwaway local
 //! stand-in, and turns on the `e2e` feature; it is never released.
 
 use url::Url;
@@ -20,6 +20,21 @@ pub const BLOB_API_URL: &str = match option_env!("SIGNFLOW_HELPER_BLOB_API_URL")
     Some(v) => v,
     None => "https://vercel.com/api/blob",
 };
+
+/// Where the helper asks whether a newer version is out: latest.json of the
+/// newest PUBLISHED release of the helper's public GitHub repository (GitHub
+/// never answers this address with a draft or a pre-release). Read every six
+/// hours and when she asks; it is only a pointer, and nothing it names is
+/// installed unless its signature checks out against the public key built
+/// into the helper (tauri.conf.json, plugins.updater.pubkey).
+pub const UPDATE_MANIFEST_URL: &str = match option_env!("SIGNFLOW_HELPER_UPDATE_URL") {
+    Some(v) => v,
+    None => "https://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/latest/download/latest.json",
+};
+
+/// The only place a release build downloads an update from: a file of one of
+/// this repository's own releases.
+const UPDATE_DOWNLOAD_PREFIX: &str = "https://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/download/";
 
 /// The Blob API version @vercel/blob 2.7 sends (`x-api-version`).
 pub const BLOB_API_VERSION: &str = "12";
@@ -87,12 +102,24 @@ pub fn download_url_allowed(url: &Url) -> bool {
             .unwrap_or(false)
 }
 
-/// The release talks to SignFlow and the store over HTTPS only.
+/// Whether an update latest.json points to is one the helper will download:
+/// a file of this repository's own GitHub releases over HTTPS (the release),
+/// or the local stand-in (the e2e build only). Checked before anything is
+/// downloaded; the signature is checked after.
+pub fn update_download_allowed(url: &Url) -> bool {
+    if cfg!(feature = "e2e") {
+        return url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
+    }
+    // Url has already resolved any "." and ".." in the path.
+    url.as_str().starts_with(UPDATE_DOWNLOAD_PREFIX) && url.query().is_none() && url.fragment().is_none()
+}
+
+/// The release talks to SignFlow, the store and GitHub over HTTPS only.
 pub fn endpoints_are_safe() -> bool {
     if cfg!(feature = "e2e") {
         return true;
     }
-    SIGNFLOW_URL.starts_with("https://") && BLOB_API_URL.starts_with("https://")
+    SIGNFLOW_URL.starts_with("https://") && BLOB_API_URL.starts_with("https://") && UPDATE_MANIFEST_URL.starts_with("https://")
 }
 
 #[cfg(test)]
@@ -105,7 +132,25 @@ mod tests {
             assert!(endpoints_are_safe());
             assert_eq!(SIGNFLOW_URL, "https://signflow-neon.vercel.app");
             assert_eq!(BLOB_API_URL, "https://vercel.com/api/blob");
+            assert_eq!(UPDATE_MANIFEST_URL, "https://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/latest/download/latest.json");
         }
+    }
+
+    #[test]
+    fn updates_only_from_this_repositorys_releases() {
+        if cfg!(feature = "e2e") {
+            return;
+        }
+        let ok = |u: &str| update_download_allowed(&Url::parse(u).unwrap());
+        assert!(ok("https://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/download/v0.1.4/SignFlow-Helper_0.1.4_x64-setup.exe"));
+        assert!(ok("https://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/download/v0.1.4/SignFlow-Helper_0.1.4_universal.app.tar.gz"));
+        assert!(!ok("http://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/download/v0.1.4/x.exe"));
+        assert!(!ok("https://github.com/someone-else/signflow-helper/releases/download/v0.1.4/x.exe"));
+        assert!(!ok("https://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/download/../../../someone-else/x/releases/download/v1/x.exe"));
+        assert!(!ok("https://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/download/%2e%2e/%2e%2e/x.exe"));
+        assert!(!ok("https://github.com.evil.example/ahayrulabusiness-dotcom/signflow-helper/releases/download/v0.1.4/x.exe"));
+        assert!(!ok("https://github.com/ahayrulabusiness-dotcom/signflow-helper/releases/download/v0.1.4/x.exe?y=1"));
+        assert!(!ok("http://127.0.0.1:4702/x.exe"));
     }
 
     #[test]

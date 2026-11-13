@@ -1,3 +1,4 @@
 {
-  "bundle": { "createUpdaterArtifacts": false }
+  "bundle": { "createUpdaterArtifacts": false },
+  "plugins": { "updater": { "dangerousInsecureTransportProtocol": true } }
 }

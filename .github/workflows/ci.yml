@@ -2,8 +2,10 @@ name: CI
 
 # Every push and pull request, on Windows and on macOS: the tests, an
 # end-to-end run of an installed e2e build against a throwaway stand-in on the
-# runner, and a build of the release installer (.exe; universal .dmg). Needs
-# no secret; nothing is published.
+# runner, an end-to-end UPDATE run (the next version built here, signed with
+# a key made in this run and thrown away, served by a stand-in update
+# address), and a build of the release installer (.exe; universal .dmg).
+# Needs no secret; nothing is published.
 
 on:
   push:
@@ -21,7 +23,7 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 75
+    timeout-minutes: 95
     defaults:
       run:
         shell: pwsh
@@ -40,6 +42,20 @@ jobs:
 
       - name: Install the Tauri CLI
         run: npm ci
+
+      - name: A throwaway update-signing key for the e2e runs (made here, never a release key)
+        run: |
+          New-Item -ItemType Directory -Force e2e/work | Out-Null
+          npx tauri signer generate --ci -w e2e/work/e2e-update.key *> e2e/work/keygen.log
+          if (-not (Test-Path e2e/work/e2e-update.key.pub)) { Write-Host "::error title=no e2e key::$(Get-Content e2e/work/keygen.log -Raw)"; exit 1 }
+          $pub = (Get-Content e2e/work/e2e-update.key.pub -Raw).Trim()
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $p = $v.Split("."); $next = "$($p[0]).$($p[1]).$([int]$p[2] + 1)"
+          @{ plugins = @{ updater = @{ pubkey = $pub } } } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 e2e/work/e2e-update.conf.json
+          @{ version = $next; bundle = @{ createUpdaterArtifacts = $true } } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 e2e/work/e2e-next.conf.json
+          "E2E_CURRENT=$v" >> $env:GITHUB_ENV
+          "E2E_NEXT=$next" >> $env:GITHUB_ENV
+          Write-Host "::notice title=update e2e::$v is installed, $next is served; both trust only a key made in this run"
 
       - name: Unit tests (links, API client, uploads, save watcher)
         working-directory: src-tauri
@@ -68,12 +84,13 @@ jobs:
             exit 1
           }
 
-      - name: Build the e2e installer (talks to the stand-in on 127.0.0.1)
+      - name: Build the e2e installer (talks to the stand-ins on 127.0.0.1)
         env:
           SIGNFLOW_HELPER_BASE_URL: http://127.0.0.1:4700
           SIGNFLOW_HELPER_BLOB_API_URL: http://127.0.0.1:4701/api/blob
+          SIGNFLOW_HELPER_UPDATE_URL: http://127.0.0.1:4702/latest.json
         run: |
-          npx tauri build --features e2e --bundles nsis --config e2e/tauri.e2e.conf.json 2>&1 | Tee-Object -FilePath build-e2e.log
+          npx tauri build --features e2e --bundles nsis --config e2e/tauri.e2e.conf.json --config e2e/work/e2e-update.conf.json 2>&1 | Tee-Object -FilePath build-e2e.log
           if ($LASTEXITCODE -ne 0) {
             $tail = (Get-Content build-e2e.log | Select-String -Pattern 'error' -Context 0,6 | Select-Object -Last 12 | ForEach-Object { $_.ToString() }) -join "%0A"
             Write-Host "::error title=e2e build failed::$tail"
@@ -86,6 +103,38 @@ jobs:
         run: |
           npm install --no-save --prefix e2e playwright-core@1.49.1
           ./e2e/run.ps1 -Installer (Resolve-Path e2e-setup.exe).Path
+
+      - name: Build the e2e next version, signed with the throwaway key
+        env:
+          SIGNFLOW_HELPER_BASE_URL: http://127.0.0.1:4700
+          SIGNFLOW_HELPER_BLOB_API_URL: http://127.0.0.1:4701/api/blob
+          SIGNFLOW_HELPER_UPDATE_URL: http://127.0.0.1:4702/latest.json
+        run: |
+          $env:TAURI_SIGNING_PRIVATE_KEY = (Resolve-Path e2e/work/e2e-update.key).Path
+          npx tauri build --features e2e --bundles nsis --config e2e/tauri.e2e.conf.json --config e2e/work/e2e-update.conf.json --config e2e/work/e2e-next.conf.json 2>&1 | Tee-Object -FilePath build-e2e-next.log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = (Get-Content build-e2e-next.log | Select-String -Pattern 'error' -Context 0,6 | Select-Object -Last 12 | ForEach-Object { $_.ToString() }) -join "%0A"
+            Write-Host "::error title=e2e next-version build failed::$tail"
+            exit 1
+          }
+          Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY
+          $files = "e2e/work/update-files"
+          New-Item -ItemType Directory -Force $files | Out-Null
+          $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_$($env:E2E_NEXT)_x64-setup.exe" | Select-Object -First 1
+          $name = "SignFlow-Helper_$($env:E2E_NEXT)_x64-setup.exe"
+          Copy-Item $setup.FullName "$files/$name"
+          Copy-Item "$($setup.FullName).sig" "$files/$name.sig"
+          # Signed properly for the version, but not an installer.
+          $junk = New-Object byte[] 200000; [Random]::new(7).NextBytes($junk); [IO.File]::WriteAllBytes("$files/not-an-installer.bin", $junk)
+          npx tauri signer sign -f e2e/work/e2e-update.key --app-version $env:E2E_NEXT "$files/not-an-installer.bin" *> e2e/work/sign.log
+          $pub = (Get-Content e2e/work/e2e-update.conf.json -Raw | ConvertFrom-Json).plugins.updater.pubkey
+          $a = (node tools/verify-update.mjs $pub "$files/$name" "$files/$name.sig" $env:E2E_NEXT 2>&1 | Out-String).Trim()
+          $b = (node tools/verify-update.mjs $pub "$files/not-an-installer.bin" "$files/not-an-installer.bin.sig" $env:E2E_NEXT 2>&1 | Out-String).Trim()
+          Write-Host "::notice title=e2e next version::$name, $($setup.Length) bytes%0A$a%0A$b"
+          if ($a -notlike "ok:*" -or $b -notlike "ok:*") { Write-Host "::error title=e2e update files don't verify::$a%0A$b%0A$(Get-Content e2e/work/sign.log -Raw)"; exit 1 }
+
+      - name: End-to-end update on Windows (every failure, then the real update while a file is open)
+        run: ./e2e/run-update.ps1 -Old (Resolve-Path e2e-setup.exe).Path -Files e2e/work/update-files -Current $env:E2E_CURRENT -Next $env:E2E_NEXT
 
       - name: Build the release installer
         run: |
@@ -106,14 +155,15 @@ jobs:
           path: |
             unit-tests*.log
             build-*.log
-            e2e/work/summary.md
-            e2e/work/helper.log
-            e2e/work/standin.*
+            e2e/work/summary*.md
+            e2e/work/helper*.log
+            e2e/work/standin*
+            e2e/work/update-server.*
           if-no-files-found: ignore
 
   macos:
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 110
     defaults:
       run:
         shell: bash
@@ -135,6 +185,22 @@ jobs:
       - name: Install the Tauri CLI
         run: npm ci
 
+      - name: A throwaway update-signing key for the e2e runs (made here, never a release key)
+        run: |
+          mkdir -p e2e/work
+          npx tauri signer generate --ci -w e2e/work/e2e-update.key > e2e/work/keygen.log 2>&1 || true
+          [ -f e2e/work/e2e-update.key.pub ] || { echo "::error title=no e2e key::$(cat e2e/work/keygen.log)"; exit 1; }
+          v=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          next=$(V="$v" node -p 'const p = process.env.V.split("."); p[2] = String(Number(p[2]) + 1); p.join(".")')
+          PUB="$(tr -d '\r\n' < e2e/work/e2e-update.key.pub)" NEXT="$next" node -e '
+            const fs = require("fs");
+            fs.writeFileSync("e2e/work/e2e-update.conf.json", JSON.stringify({ plugins: { updater: { pubkey: process.env.PUB } } }));
+            fs.writeFileSync("e2e/work/e2e-next.conf.json", JSON.stringify({ version: process.env.NEXT, bundle: { createUpdaterArtifacts: true } }));
+          '
+          echo "E2E_CURRENT=$v" >> "$GITHUB_ENV"
+          echo "E2E_NEXT=$next" >> "$GITHUB_ENV"
+          echo "::notice title=macOS update e2e::$v is installed, $next is served; both trust only a key made in this run"
+
       - name: Unit tests on macOS (links, API client, uploads, save watcher)
         working-directory: src-tauri
         run: |
@@ -155,13 +221,14 @@ jobs:
         working-directory: src-tauri
         run: cargo test --color never --features e2e -- --test-threads 1
 
-      - name: Build the e2e app and .dmg (talks to the stand-in on 127.0.0.1)
+      - name: Build the e2e app and .dmg (talks to the stand-ins on 127.0.0.1)
         env:
           SIGNFLOW_HELPER_BASE_URL: http://127.0.0.1:4700
           SIGNFLOW_HELPER_BLOB_API_URL: http://127.0.0.1:4701/api/blob
+          SIGNFLOW_HELPER_UPDATE_URL: http://127.0.0.1:4702/latest.json
         run: |
           set +e
-          npx tauri build --features e2e --bundles app,dmg --config e2e/tauri.e2e.conf.json 2>&1 | tee build-e2e-mac.log
+          npx tauri build --features e2e --bundles app,dmg --config e2e/tauri.e2e.conf.json --config e2e/work/e2e-update.conf.json 2>&1 | tee build-e2e-mac.log
           code=${PIPESTATUS[0]}
           set -e
           if [ "$code" != "0" ]; then
@@ -175,6 +242,39 @@ jobs:
 
       - name: End-to-end on macOS (install from .dmg, links with open, saves, stale, Done)
         run: node e2e/run-mac.mjs "$PWD/e2e-mac.dmg"
+
+      - name: Build the e2e next version, signed with the throwaway key (macOS)
+        env:
+          SIGNFLOW_HELPER_BASE_URL: http://127.0.0.1:4700
+          SIGNFLOW_HELPER_BLOB_API_URL: http://127.0.0.1:4701/api/blob
+          SIGNFLOW_HELPER_UPDATE_URL: http://127.0.0.1:4702/latest.json
+        run: |
+          set +e
+          TAURI_SIGNING_PRIVATE_KEY="$PWD/e2e/work/e2e-update.key" npx tauri build --features e2e --bundles app --config e2e/tauri.e2e.conf.json --config e2e/work/e2e-update.conf.json --config e2e/work/e2e-next.conf.json 2>&1 | tee build-e2e-next-mac.log
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" != "0" ]; then
+            tail=$(grep -E -A6 'error|Error' build-e2e-next-mac.log | tail -30 | awk 'BEGIN{ORS="%0A"} {print}')
+            echo "::error title=macOS e2e next-version build failed::$tail"
+            exit 1
+          fi
+          files=e2e/work/update-files
+          mkdir -p "$files"
+          B=src-tauri/target/release/bundle/macos
+          name="SignFlow-Helper_${E2E_NEXT}_e2e.app.tar.gz"
+          cp "$B/SignFlow Helper.app.tar.gz" "$files/$name"
+          cp "$B/SignFlow Helper.app.tar.gz.sig" "$files/$name.sig"
+          # Signed properly for the version, but not an app.
+          head -c 200000 /dev/urandom > "$files/not-an-installer.bin"
+          npx tauri signer sign -f e2e/work/e2e-update.key --app-version "$E2E_NEXT" "$files/not-an-installer.bin" > e2e/work/sign.log 2>&1 || true
+          pub=$(node -p 'JSON.parse(require("fs").readFileSync("e2e/work/e2e-update.conf.json","utf8")).plugins.updater.pubkey')
+          a=$(node tools/verify-update.mjs "$pub" "$files/$name" "$files/$name.sig" "$E2E_NEXT" 2>&1)
+          b=$(node tools/verify-update.mjs "$pub" "$files/not-an-installer.bin" "$files/not-an-installer.bin.sig" "$E2E_NEXT" 2>&1)
+          echo "::notice title=macOS e2e next version::$name, $(stat -f%z "$files/$name") bytes%0A$a%0A$b"
+          case "$a$b" in ok:*ok:*) ;; *) echo "::error title=e2e update files don't verify::$a%0A$b%0A$(cat e2e/work/sign.log)"; exit 1;; esac
+
+      - name: End-to-end update on macOS (every failure, then the real update while a file is open)
+        run: node e2e/run-update-mac.mjs e2e/work/update-files "$E2E_CURRENT" "$E2E_NEXT"
 
       - name: Build the universal release app and .dmg (Apple Silicon + Intel)
         run: |
@@ -205,7 +305,8 @@ jobs:
           path: |
             unit-tests-mac.log
             build-*-mac.log
-            e2e/work/summary-mac.md
-            e2e/work/helper-mac.log
-            e2e/work/standin.*
+            e2e/work/summary*.md
+            e2e/work/helper*.log
+            e2e/work/standin*
+            e2e/work/update-server.*
           if-no-files-found: ignore

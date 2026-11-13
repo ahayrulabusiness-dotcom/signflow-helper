@@ -22,6 +22,8 @@ address is built in and never read from a link.
 | Her copy on this computer and what's been saved | `src-tauri/src/store.rs` |
 | One edit, start to Done, including the "someone saved a newer version" question | `src-tauri/src/session.rs` |
 | The tray, the stale window, links arriving | `src-tauri/src/app.rs`, `ui/stale.*` |
+| Updates: the rules (versions, failures, "Not now", never while editing) | `src-tauri/src/update.rs` |
+| Updates: the check, the dot, the menu and the update window | `src-tauri/src/app.rs`, `ui/update.*` |
 
 Files live in `%LOCALAPPDATA%\SignFlow Helper Files\files\<file id>\` on
 Windows and `~/Library/Application Support/SignFlow Helper Files/files/<file id>/`
@@ -32,10 +34,35 @@ a Mac it is dragged from the .dmg into /Applications. The Mac app is ad-hoc
 signed (no Apple developer account, not notarized), so macOS asks once before
 it first opens.
 
-## Builds and tests (GitHub Actions, Windows)
+## Updates
+
+On start and every six hours the helper reads `latest.json` of this
+repository's newest published release
+(`releases/latest/download/latest.json`; GitHub never answers that address
+with a draft). If its version is higher, the tray picture gets a dot, the menu
+says "Update to <version>", and a small window offers it once — "Not now"
+keeps the window away for a day; the dot and the menu stay. A failed check
+only shows in the menu ("Couldn't check for updates").
+
+Update downloads the file for this computer (Windows: the installer; Mac: the
+`.app.tar.gz`), only from this repository's releases, and checks its signature
+— and the version it was signed for — against the public key built in before
+anything else happens. It never installs while a file is open: it says
+"Finish your edit first" and installs as soon as she clicks Done. Windows: the
+installer runs for this user only and starts the helper again. Mac: the app in
+Applications is swapped for the new one in one step, then the helper starts
+again. Nothing in her files folder is touched, and every failure (a bad
+signature, a cut-off download, no connection, a full disk, an install that
+fails) says what happened and leaves the installed version as it was.
+
+## Builds and tests (GitHub Actions, Windows and macOS)
 
 - **CI** (every push, on Windows and on macOS): the unit tests, an end-to-end
-  run, and a build of the release installer (.exe; universal .dmg). The end-to-end run installs an e2e build silently and
+  run, an end-to-end update run, and a build of the release installer (.exe;
+  universal .dmg). The update run builds the next version in the same job,
+  signs it with a key made for that run only, serves it from a stand-in
+  update address (`e2e/standin/update-server.mjs`), and goes through every
+  failure before installing it for real while a file is open. The end-to-end run installs an e2e build silently and
   points it at a throwaway stand-in for SignFlow and its file store on the
   runner (`e2e/standin/server.mjs`). It then fires links, saves the file the
   ways Flexi might, answers the stale question (once by clicking the real
@@ -46,7 +73,10 @@ it first opens.
   `src-tauri/tauri.conf.json`), or use "Run workflow". It makes a **draft**
   release with the Windows installer (`SignFlow-Helper_<version>_x64-setup.exe`),
   the Mac app (`SignFlow-Helper_<version>_universal.dmg`), each platform's
-  signed update and one `latest.json` that serves both. A draft isn't public until someone
+  signed update and one `latest.json` that serves both. Its notes come from
+  `release-notes/<version>.txt` (shown in the update window), and both updates'
+  signatures are checked against the built-in public key first
+  (`tools/verify-update.mjs`). A draft isn't public until someone
   publishes it; a version that is already published is never touched.
 
 ## Update signing

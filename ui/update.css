@@ -1,0 +1,22 @@
+:root { --bg: #ffffff; --ink: #1c2230; --muted: #5b6372; --line: #dcdfe4; --accent: #1f4fbf; --on-accent: #ffffff; --soft: #f3f5f9; color-scheme: light dark; }
+@media (prefers-color-scheme: dark) { :root { --bg: #1c2028; --ink: #e8eaee; --muted: #a2a9b6; --line: #2e3440; --accent: #8fb0ff; --on-accent: #10172a; --soft: #252a33; } }
+* { box-sizing: border-box; }
+/* The buttons' `all: unset` would undo the browser's own rule for hidden things. */
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif; }
+main { height: 100%; padding: 18px 20px 16px; display: flex; flex-direction: column; gap: 12px; }
+h1 { margin: 0; font-size: 17px; font-weight: 700; }
+p { margin: 0; }
+#message { color: var(--muted); }
+.bar { height: 8px; border-radius: 4px; background: var(--soft); border: 1px solid var(--line); overflow: hidden; }
+.bar > div { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+.notes { min-height: 0; flex: 1 1 auto; overflow: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--soft); }
+.notes h2 { margin: 0 0 4px; font-size: 12.5px; font-weight: 700; color: var(--muted); }
+#notes { white-space: pre-line; font-size: 13px; }
+.buttons { margin-top: auto; display: flex; justify-content: flex-end; gap: 8px; }
+button { all: unset; box-sizing: border-box; min-height: 36px; padding: 8px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; text-align: center; }
+button.primary { background: var(--accent); color: var(--on-accent); }
+button.secondary { color: var(--accent); border: 1px solid var(--line); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .bar > div { transition: none; } }

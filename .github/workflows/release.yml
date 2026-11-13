@@ -2,7 +2,9 @@ name: Release
 
 # Makes a DRAFT release (not public) with the Windows installer, the macOS
 # .dmg (universal: Apple Silicon and Intel), each platform's signed update and
-# one latest.json that serves both. Run it by pushing a version tag (v0.1.2)
+# one latest.json that serves both (its notes from release-notes/<version>.txt;
+# every update file's signature is checked against the public key built into
+# the app before the draft is made). Run it by pushing a version tag (v0.1.3)
 # or with "Run workflow". The update-signing key comes only from the
 # repository's secret settings and signs both platforms' updates; nothing in
 # this repository is a secret.
@@ -193,6 +195,11 @@ jobs:
           v=$(node -p 'require("./src-tauri/tauri.conf.json").version')
           tag="v$v"
           base="https://github.com/$REPO/releases/download/$tag"
+          # What the update window shows under "What's new".
+          if [ ! -s "release-notes/$v.txt" ]; then
+            echo "::error title=no release notes::Add release-notes/$v.txt (a few plain lines; the update window shows them)."
+            exit 1
+          fi
           # The updater picks its entry by platform: Windows by
           # windows-x86_64 (after windows-x86_64-nsis); a Mac by
           # darwin-<arch>-app, then darwin-<arch> (aarch64 = Apple Silicon,
@@ -205,7 +212,7 @@ jobs:
             const exe = `SignFlow-Helper_${v}_x64-setup.exe`, mac = `SignFlow-Helper_${v}_universal.app.tar.gz`;
             const latest = {
               version: v,
-              notes: `SignFlow Helper ${v}`,
+              notes: fs.readFileSync(`release-notes/${v}.txt`, "utf8").trim(),
               pub_date: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
               platforms: {
                 "windows-x86_64-nsis": { signature: sig(exe), url: `${base}/${exe}` },
@@ -219,6 +226,13 @@ jobs:
             fs.writeFileSync("dist/latest.json", JSON.stringify(latest, null, 2) + "\n");
           '
           ls -l dist
+          # The installed app only accepts a file signed by the key whose public
+          # half it carries, for exactly this version: check both updates the
+          # same way before anything is uploaded.
+          for f in "SignFlow-Helper_${v}_x64-setup.exe" "SignFlow-Helper_${v}_universal.app.tar.gz"; do
+            out=$(node tools/verify-update.mjs src-tauri/tauri.conf.json "dist/$f" "dist/$f.sig" "$v" 2>&1) || { echo "::error title=signature doesn't verify::$out"; exit 1; }
+            echo "::notice title=signature checked::$out"
+          done
           if [ "$GITHUB_REF_TYPE" != "tag" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
             for f in dist/*; do echo "::notice title=dry run file::$(basename "$f"), $(stat -c%s "$f") bytes"; done
             echo "::notice title=dry run latest.json::$(sed 's/"signature": "[^"]*"/"signature": "…"/' dist/latest.json | awk 'BEGIN{ORS="%0A"} {print}')"

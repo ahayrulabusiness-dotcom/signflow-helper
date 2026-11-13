@@ -12,6 +12,7 @@ mod link;
 mod logfile;
 mod session;
 mod store;
+mod update;
 mod watcher;
 
 fn main() {
