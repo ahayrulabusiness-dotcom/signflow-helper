@@ -132,6 +132,7 @@ Check "tray: the dot is on" (Seen "UPDATE dot on")
 Check "menu: 'Update to $Next' and 'Check for updates now'" (Seen "UPDATE menu: Update to $Next")
 $w = Window "later"
 Check "Not now: clicked in the window" ([bool](WaitLog "UPDATE window: later clicked" 20)) "$($w.clickError)"
+Check "…and the window closes" ([bool](WaitLog "UPDATE window closed" 20))
 $saved = WaitFor { try { Get-Content (Join-Path $data "update.json") -Raw | ConvertFrom-Json } catch { $null } } 10
 $hours = if ($saved) { ([DateTimeOffset]::FromUnixTimeSeconds([long]$saved.snoozedUntil) - [DateTimeOffset]::UtcNow).TotalHours } else { 0 }
 Check "Not now snoozes for 24 hours (update.json)" ($hours -gt 23.9 -and $hours -le 24.0) "$([math]::Round($hours, 3)) hours"
@@ -143,12 +144,14 @@ Check "…and the dot stays on" (-not (Seen "UPDATE dot off"))
 Mark
 Control "check"
 Check "Check for updates now shows it even while snoozed" ([bool](WaitLog "UPDATE window shown" 30))
+Mark
 Window "later" | Out-Null
+WaitLog "UPDATE window closed" 20 | Out-Null
 
 # ---- Every failure says what happened and leaves $Current working
 $pid0 = (Helper).Id
 foreach ($case in @(
-    @{ mode = "tampered"; failure = "bad signature"; words = "didn't pass its safety check" },
+    @{ mode = "tampered"; failure = "bad signature"; words = "The update didn't pass its safety check" },
     @{ mode = "cut"; failure = "interrupted"; words = "The download stopped before it finished" },
     @{ mode = "dead"; failure = "no signal"; words = "Couldn't reach the internet" },
     @{ mode = "garbage"; failure = "install failed"; words = "The update couldn't be installed" }
@@ -164,7 +167,9 @@ foreach ($case in @(
   Check "$($case.mode): '$($case.failure)', said in the window" ($failed -and $said -and $w.message -like "*$($case.words)*" -and $w.message -like "*Nothing was changed: SignFlow Edit $Current still works.*") "$($w.message) $($w.error)"
   Check "$($case.mode): Try again and Close" (($w.buttons -join "|") -eq "Close=close|Try again=retry") "$($w.buttons -join ' | ')"
   Check "$($case.mode): $Current still installed and running (same process)" ((Helper).Id -eq $pid0 -and (ExeVersion) -like "$Current*" -and (RegVersion) -eq $Current) "pid $((Helper).Id) vs $pid0, exe $(ExeVersion)"
+  Mark
   Window "close" | Out-Null
+  WaitLog "UPDATE window closed" 20 | Out-Null
 }
 $saved = Get-Content (Join-Path $data "update.json") -Raw | ConvertFrom-Json
 Check "no failed try left an install half-recorded" (-not $saved.installing)

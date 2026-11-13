@@ -147,6 +147,7 @@ try {
   check("menu bar: the dot is on", seen("UPDATE dot on"));
   check(`menu: 'Update to ${next}'`, seen(`UPDATE menu: Update to ${next}`));
   await control("not-now");
+  check("…and the window closes", await waitLog("UPDATE window closed", 20));
   const saved = await waitFor(() => JSON.parse(readFileSync(join(data, "update.json"), "utf8")), 10);
   const hours = saved ? (saved.snoozedUntil - Date.now() / 1000) / 3600 : 0;
   check("Not now snoozes for 24 hours (update.json)", hours > 23.9 && hours <= 24, `${hours.toFixed(3)} hours`);
@@ -274,8 +275,12 @@ try {
   const aPath = await waitFor(() => fileIn("After.fs"), 30);
   check(`${next}: a link opens the file`, aOpen && aPath, aPath);
   const mineA = b(`After the update, saved ${randomInt(1e9)}`);
+  const afterMark = logText().length;
   if (aPath) saveLikeMac(aPath, mineA);
-  check(`${next}: a save is uploaded as the new version`, await waitFor(async () => (await fileRow(af.id))?.sha256 === sha(mineA), 60));
+  const uploadedA = await waitFor(async () => (await fileRow(af.id))?.sha256 === sha(mineA), 90);
+  // If not, say why: what the helper logged about it, and who holds the file open.
+  const why = uploadedA ? "" : `${logText().slice(afterMark).split("\n").filter((l) => /After\.fs|save|STATUS|watch|session/.test(l)).slice(-10).join(" / ")} / lsof: ${aPath ? tryRun("/usr/sbin/lsof", ["--", aPath]).replace(/\s+/g, " ").slice(0, 400) : "-"}`;
+  check(`${next}: a save is uploaded as the new version`, uploadedA, why);
   await control("done");
   check(`${next}: Done ends the edit`, await waitFor(async () => (await editOf(af.id))?.open === false, 60));
 

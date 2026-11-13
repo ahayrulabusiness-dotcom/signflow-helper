@@ -724,7 +724,10 @@ async fn check_for_updates(app: AppHandle, asked: bool) {
         let shared = app.state::<Shared>();
         let editing = shared.current.lock().unwrap().is_some();
         let snoozed = update::Saved::read(&shared.ctx.home).snoozed(update::now_secs());
-        if app.get_webview_window(UPDATE_WINDOW).is_some() || update::pop_up(asked, editing, snoozed) {
+        if app.get_webview_window(UPDATE_WINDOW).is_some() {
+            logfile::info("UPDATE the window is open: its words are updated");
+            show_update_window(&app);
+        } else if update::pop_up(asked, editing, snoozed) {
             show_update_window(&app);
         } else {
             logfile::info(&format!(
@@ -955,6 +958,7 @@ fn show_update_window(app: &AppHandle) {
                 let app2 = app.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Destroyed = event {
+                        logfile::info("UPDATE window closed");
                         // Closed without choosing: the same as "Not now".
                         let unanswered = matches!(*app2.state::<Shared>().update_phase.lock().unwrap(), Phase::Available { .. });
                         if unanswered {
