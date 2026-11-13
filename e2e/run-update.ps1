@@ -63,7 +63,9 @@ function Seen([string]$text) { (Since).Contains($text) }
 function WaitLog([string]$text, [int]$seconds) { WaitFor { Seen $text } $seconds }
 function Opened { if (Test-Path "$work\opened.txt") { (Get-Content "$work\opened.txt" | Where-Object { $_ } | Select-Object -Last 1) } }
 function OpenLink([string]$pass) { Start-Process "signflow-edit://open?pass=$pass" }
-function Tell([string]$text, [string]$file) { [IO.File]::WriteAllText((Join-Path $data $file), $text, [Text.UTF8Encoding]::new($false)) }
+# Written whole under a temporary name and renamed into place, the word ended
+# by a line break, so the helper never reads one half written.
+function Tell([string]$text, [string]$file) { $dst = Join-Path $data $file; $tmp = "$dst.writing"; [IO.File]::WriteAllText($tmp, "$text`n", [Text.UTF8Encoding]::new($false)); [IO.File]::Move($tmp, $dst, $true) }
 function Control([string]$text) { Tell $text "e2e-control.txt"; WaitFor { -not (Test-Path (Join-Path $data "e2e-control.txt")) } 15 | Out-Null }
 function FileRow([string]$id) { (State).files | Where-Object { $_.id -eq $id } }
 function EditOf([string]$id) { (State).edits | Where-Object { $_.fileId -eq $id } | Select-Object -Last 1 }

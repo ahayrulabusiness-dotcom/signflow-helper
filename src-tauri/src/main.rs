@@ -8,6 +8,8 @@ mod api;
 mod app;
 mod blob;
 mod config;
+#[cfg(feature = "e2e")]
+mod e2e_files;
 mod link;
 mod logfile;
 mod session;

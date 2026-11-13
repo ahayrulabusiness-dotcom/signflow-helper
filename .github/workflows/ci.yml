@@ -98,6 +98,10 @@ jobs:
           }
           $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           Copy-Item $setup.FullName e2e-setup.exe
+          # The test hooks are in this build (so the release build's check below can see them).
+          $hooks = (node tools/check-test-hooks.mjs src-tauri/target/release/signflow-helper.exe present 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=test hooks check::$hooks"; exit 1 }
+          Write-Host "::notice title=e2e build test hooks::$hooks"
 
       - name: End-to-end on Windows (install, links, saves, stale choices, 500MB)
         run: |
@@ -146,6 +150,10 @@ jobs:
           }
           $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           Write-Host "::notice title=release installer::$($setup.Name), $([math]::Round($setup.Length / 1MB, 2)) MB ($($setup.Length) bytes)"
+          # The program the installer carries has none of the e2e build's test hooks.
+          $hooks = (node tools/check-test-hooks.mjs src-tauri/target/release/signflow-helper.exe absent 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=release build carries test hooks::$hooks"; exit 1 }
+          Write-Host "::notice title=release build test hooks::$hooks"
 
       - name: Keep the logs
         if: always()
@@ -239,6 +247,9 @@ jobs:
           dmg=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -1)
           cp "$dmg" e2e-mac.dmg
           echo "::notice title=macOS e2e build::$(basename "$dmg"), $(stat -f%z "$dmg") bytes"
+          # The test hooks are in this build (so the release build's check below can see them).
+          hooks=$(node tools/check-test-hooks.mjs "src-tauri/target/release/bundle/macos/SignFlow Helper.app/Contents/MacOS/signflow-helper" present) || { echo "::error title=test hooks check::$hooks"; exit 1; }
+          echo "::notice title=macOS e2e build test hooks::$hooks"
 
       - name: End-to-end on macOS (install from .dmg, links with open, saves, stale, Done)
         run: node e2e/run-mac.mjs "$PWD/e2e-mac.dmg"
@@ -296,6 +307,9 @@ jobs:
           echo "::notice title=macOS release build::$(basename "$dmg"), $(stat -f%z "$dmg") bytes%0Aarchitectures: $archs%0A$sig%0Acodesign --verify --deep --strict: $verified"
           case "$archs" in *x86_64*arm64*|*arm64*x86_64*) ;; *) echo "::error title=not universal::$archs"; exit 1;; esac
           [ "$verified" = yes ] || { echo "::error title=signature does not verify::$sig"; exit 1; }
+          # The app's program has none of the e2e build's test hooks.
+          hooks=$(node tools/check-test-hooks.mjs "$app/Contents/MacOS/signflow-helper" absent) || { echo "::error title=release build carries test hooks::$hooks"; exit 1; }
+          echo "::notice title=macOS release build test hooks::$hooks"
 
       - name: Keep the logs
         if: always()

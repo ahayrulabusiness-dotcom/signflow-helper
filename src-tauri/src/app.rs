@@ -121,15 +121,18 @@ impl Ui for TrayUi {
             // The e2e run answers through a file; one part of it leaves the
             // file out and clicks the real window instead.
             let f = config::home_dir().join("e2e-choice.txt");
-            match std::fs::read(&f) {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    let text = text.trim_start_matches('\u{feff}').trim();
+            match crate::e2e_files::read(&f) {
+                crate::e2e_files::TestFile::Word(text) => {
                     logfile::info(&format!("ASK answered by the test: {text}"));
-                    let _ = tx.send(Choice::parse(text));
+                    let _ = tx.send(Choice::parse(&text));
                     return rx;
                 }
-                Err(e) => logfile::info(&format!("ASK: no test answer at {} ({e}); showing the window", f.display())),
+                // Caught half written: the window's own look at the file
+                // (below) reads it again once it's whole.
+                crate::e2e_files::TestFile::Unfinished(so_far) => {
+                    logfile::info(&format!("ASK: the test's answer isn't finished yet ({so_far:?}); showing the window, which reads it again"))
+                }
+                crate::e2e_files::TestFile::Missing(e) => logfile::info(&format!("ASK: no test answer at {} ({e}); showing the window", f.display())),
             }
         }
         let shared = self.app.state::<Shared>();
@@ -175,8 +178,8 @@ impl Ui for TrayUi {
                                 if !waiting {
                                     return;
                                 }
-                                if let Ok(bytes) = std::fs::read(&f) {
-                                    let text = String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').trim().to_string();
+                                // Only a whole answer counts (see e2e_files.rs).
+                                if let crate::e2e_files::TestFile::Word(text) = crate::e2e_files::read(&f) {
                                     logfile::info(&format!("ASK answered by the test (late): {text}"));
                                     answer(&app3, &mine, Choice::parse(&text));
                                     if let Some(w) = app3.get_webview_window(&mine) {
@@ -545,35 +548,48 @@ pub fn run() {
                 let h = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     let f = config::home_dir().join("e2e-control.txt");
+                    let mut unfinished: Option<String> = None;
                     loop {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        if let Ok(text) = std::fs::read_to_string(&f) {
-                            let _ = std::fs::remove_file(&f);
-                            let asked = text.trim_start_matches('\u{feff}').trim().to_string();
-                            logfile::info(&format!("e2e: {asked} asked"));
-                            match asked.as_str() {
-                                "done" => {
-                                    send_control(&h, Control::Done);
+                        // Only a whole word counts: one caught half written is
+                        // left for the next look, never deleted (a run once
+                        // lost its Done that way; see e2e_files.rs).
+                        let asked = match crate::e2e_files::read(&f) {
+                            crate::e2e_files::TestFile::Word(word) => word,
+                            crate::e2e_files::TestFile::Unfinished(so_far) => {
+                                if unfinished.as_deref() != Some(so_far.as_str()) {
+                                    logfile::info(&format!("e2e: the control file isn't finished yet ({so_far:?}); reading it again"));
+                                    unfinished = Some(so_far);
                                 }
-                                // The menu's "Check for updates now", and the
-                                // automatic check (which may not pop up).
-                                "check" => check_for_updates(h.clone(), true).await,
-                                "check-auto" => check_for_updates(h.clone(), false).await,
-                                // The window's buttons (the Mac run can't click them).
-                                "update" => start_update(&h),
-                                "not-now" => {
-                                    snooze(&h);
-                                    // The window may still be on its way.
-                                    for _ in 0..20 {
-                                        if let Some(w) = h.get_webview_window(UPDATE_WINDOW) {
-                                            let _ = w.close();
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(250)).await;
-                                    }
-                                }
-                                _ => {}
+                                continue;
                             }
+                            crate::e2e_files::TestFile::Missing(_) => continue,
+                        };
+                        unfinished = None;
+                        let _ = std::fs::remove_file(&f);
+                        logfile::info(&format!("e2e: {asked} asked"));
+                        match asked.as_str() {
+                            "done" => {
+                                send_control(&h, Control::Done);
+                            }
+                            // The menu's "Check for updates now", and the
+                            // automatic check (which may not pop up).
+                            "check" => check_for_updates(h.clone(), true).await,
+                            "check-auto" => check_for_updates(h.clone(), false).await,
+                            // The window's buttons (the Mac run can't click them).
+                            "update" => start_update(&h),
+                            "not-now" => {
+                                snooze(&h);
+                                // The window may still be on its way.
+                                for _ in 0..20 {
+                                    if let Some(w) = h.get_webview_window(UPDATE_WINDOW) {
+                                        let _ = w.close();
+                                        break;
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 });

@@ -44,7 +44,9 @@ function LogHas([string]$text) { (Test-Path $log) -and ((Get-Content $log -Raw) 
 function Opened { if (Test-Path "$work\opened.txt") { (Get-Content "$work\opened.txt" | Where-Object { $_ } | Select-Object -Last 1) } }
 function OpenLink([string]$pass) { Start-Process "signflow-edit://open?pass=$pass" }
 # A note for the e2e build in its folder (an answer, or "done"), plain UTF-8.
-function Tell([string]$text, [string]$file) { [IO.File]::WriteAllText((Join-Path $data $file), $text, [Text.UTF8Encoding]::new($false)) }
+# Written whole under a temporary name and renamed into place, the word ended
+# by a line break, so the helper never reads one half written.
+function Tell([string]$text, [string]$file) { $dst = Join-Path $data $file; $tmp = "$dst.writing"; [IO.File]::WriteAllText($tmp, "$text`n", [Text.UTF8Encoding]::new($false)); [IO.File]::Move($tmp, $dst, $true) }
 function FileRow([string]$id) { (State).files | Where-Object { $_.id -eq $id } }
 function EditOf([string]$id) { (State).edits | Where-Object { $_.fileId -eq $id } | Select-Object -Last 1 }
 

@@ -65,7 +65,10 @@ const seen = (t) => since().includes(t);
 const waitLog = (t, s) => waitFor(() => seen(t), s);
 async function control(text) {
   const f = join(data, "e2e-control.txt");
-  writeFileSync(f, text);
+  // Whole under a temporary name, then renamed into place, the word ended by a
+  // line break: the helper never reads it half written.
+  writeFileSync(`${f}.writing`, `${text}\n`);
+  renameSync(`${f}.writing`, f);
   await waitFor(() => !existsSync(f), 15);
 }
 const versionOf = (app) => tryRun("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleShortVersionString", join(app, "Contents/Info.plist")]);

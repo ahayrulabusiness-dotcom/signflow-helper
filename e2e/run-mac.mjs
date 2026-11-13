@@ -58,7 +58,14 @@ const editOf = async (id) => (await state()).edits.filter((e) => e.fileId === id
 const logHas = (t) => existsSync(log) && readFileSync(log, "utf8").includes(t);
 const opened = () => (existsSync(openedFile) ? readFileSync(openedFile, "utf8").split("\n").filter(Boolean).at(-1) : null);
 const openLink = (pass) => run("open", [`signflow-edit://open?pass=${pass}`]);
-const tell = (text, file) => writeFileSync(join(data, file), text);
+// A note for the e2e build in its folder (an answer, or "done"): written whole
+// under a temporary name and renamed into place, the word ended by a line
+// break, so the helper never reads one half written.
+const tell = (text, file) => {
+  const f = join(data, file);
+  writeFileSync(`${f}.writing`, `${text}\n`);
+  renameSync(`${f}.writing`, f);
+};
 // How Mac apps save: a hidden temporary beside the file, renamed over it.
 function saveLikeMac(path, bytes) {
   const tmp = join(dirname(path), `.${path.split("/").pop()}.sb-${randomInt(1e9).toString(16)}`);

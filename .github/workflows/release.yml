@@ -88,6 +88,10 @@ jobs:
             Write-Host "::error title=Windows release build failed::$tail"
             exit 1
           }
+          # The program the installer carries has none of the e2e build's test hooks.
+          $hooks = (node tools/check-test-hooks.mjs src-tauri/target/release/signflow-helper.exe absent 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=release build carries test hooks::$hooks"; exit 1 }
+          Write-Host "::notice title=test hooks::$hooks"
           $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${v}_x64-setup.exe" | Select-Object -First 1
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -161,6 +165,9 @@ jobs:
           app="$B/macos/SignFlow Helper.app"
           lipo -archs "$app/Contents/MacOS/signflow-helper" | grep -q x86_64 && lipo -archs "$app/Contents/MacOS/signflow-helper" | grep -q arm64 || { echo "::error title=not universal::$(lipo -archs "$app/Contents/MacOS/signflow-helper")"; exit 1; }
           codesign --verify --deep --strict "$app" || { echo "::error title=signature does not verify::"; exit 1; }
+          # The app's program has none of the e2e build's test hooks.
+          hooks=$(node tools/check-test-hooks.mjs "$app/Contents/MacOS/signflow-helper" absent) || { echo "::error title=release build carries test hooks::$hooks"; exit 1; }
+          echo "::notice title=test hooks::$hooks"
           mkdir -p dist
           cp "$(ls $B/dmg/*.dmg | head -1)" "dist/SignFlow-Helper_${v}_universal.dmg"
           cp "$B/macos/SignFlow Helper.app.tar.gz" "dist/SignFlow-Helper_${v}_universal.app.tar.gz"
