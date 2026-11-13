@@ -1,1 +1,1 @@
-Test update
+Done now waits for Flexi to save and close, so your changes reach SignFlow.
