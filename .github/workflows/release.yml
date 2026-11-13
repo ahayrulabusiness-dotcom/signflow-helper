@@ -147,7 +147,7 @@ jobs:
           code=${PIPESTATUS[0]}
           set -e
           if [ "$code" != "0" ]; then
-            tail=$(grep -E 'error|failed|Error|wrong|password|key' build-release-mac.log | tail -15 | sed ':a;N;$!ba;s/\n/%0A/g')
+            tail=$(grep -E 'error|failed|Error|wrong|password|key' build-release-mac.log | tail -15 | awk 'BEGIN{ORS="%0A"} {print}')
             echo "::error title=macOS release build failed::$tail"
             exit 1
           fi
@@ -191,8 +191,10 @@ jobs:
           tag="v$v"
           base="https://github.com/$REPO/releases/download/$tag"
           # The updater picks its entry by platform: Windows by
-          # windows-x86_64, a Mac by darwin-aarch64 (Apple Silicon) or
-          # darwin-x86_64 (Intel). The universal update serves both Macs.
+          # windows-x86_64 (after windows-x86_64-nsis); a Mac by
+          # darwin-<arch>-app, then darwin-<arch> (aarch64 = Apple Silicon,
+          # x86_64 = Intel; never "universal"). The universal update serves
+          # both Macs, so it is listed under all four.
           V="$v" BASE="$base" node -e '
             const fs = require("fs");
             const v = process.env.V, base = process.env.BASE;
@@ -203,8 +205,11 @@ jobs:
               notes: `SignFlow Helper ${v}`,
               pub_date: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
               platforms: {
+                "windows-x86_64-nsis": { signature: sig(exe), url: `${base}/${exe}` },
                 "windows-x86_64": { signature: sig(exe), url: `${base}/${exe}` },
+                "darwin-aarch64-app": { signature: sig(mac), url: `${base}/${mac}` },
                 "darwin-aarch64": { signature: sig(mac), url: `${base}/${mac}` },
+                "darwin-x86_64-app": { signature: sig(mac), url: `${base}/${mac}` },
                 "darwin-x86_64": { signature: sig(mac), url: `${base}/${mac}` },
               },
             };

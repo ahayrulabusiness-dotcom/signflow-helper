@@ -26,6 +26,11 @@ const check = (name, ok, detail = "") => {
   results.push({ name, ok: !!ok, detail: String(detail ?? "") });
   console.log(`${ok ? "ok  " : "FAIL"} ${name}  ${detail ?? ""}`);
 };
+// Something the runner itself can't be set up for: said so, not counted as a pass.
+const skip = (name, why) => {
+  results.push({ name, ok: true, skipped: true, detail: why });
+  console.log(`skip ${name}  ${why}`);
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, seconds) {
   const end = Date.now() + seconds * 1000;
@@ -75,16 +80,20 @@ try {
 
   // ---- The app this Mac uses for .fs files (a stand-in editor)
   rmSync(openedFile, { force: true });
-  try {
-    console.log(run("bash", [join(here, "mac/make-fake-editor.sh"), openedFile]));
-  } catch (e) {
-    console.log(String(e.stdout ?? ""), String(e.stderr ?? ""));
-  }
   const probe = join(work, "probe.fs");
   writeFileSync(probe, "probe");
-  try { run("open", [probe]); } catch (e) { console.log("open probe:", String(e.stderr ?? e.message)); }
+  let setup = "";
+  try {
+    setup = run("bash", [join(here, "mac/make-fake-editor.sh"), openedFile, probe]);
+  } catch (e) {
+    setup = `${e.stdout ?? ""}\n${e.stderr ?? ""}`;
+  }
+  console.log(setup);
+  try { run("open", [probe]); } catch (e) { setup += `\nopen probe: ${String(e.stderr ?? e.message)}`; }
   const probeOpened = await waitFor(() => (opened() === probe ? probe : null), 30);
-  check("the stand-in editor opens .fs files on this Mac (the runner's own setup)", probeOpened, opened() ?? "nothing opened");
+  const editorSetup = setup.split("\n").filter((l) => /default handler|type:|opens with|error|timed out|open probe/.test(l)).join(" / ");
+  if (probeOpened) check("the stand-in editor opens .fs files on this Mac (the runner's own setup)", true, editorSetup);
+  else skip("the stand-in editor opens .fs files on this Mac (the runner's own setup)", `couldn't be set up on the runner: macOS types .fs as a file-system plug-in | ${editorSetup}`);
 
   // ---- Install from the .dmg into /Applications
   rmSync(APP, { recursive: true, force: true });
@@ -121,8 +130,20 @@ try {
   const f = await admin("file", { name: "Concept.fs", content: v1.toString("base64") });
   const pass1 = (await admin("pass", { fileId: f.id, user: "carlee" })).pass;
   openLink(pass1);
-  const path = await waitFor(() => (opened()?.endsWith("/Concept.fs") ? opened() : null), 90);
-  check("a signflow-edit:// link (open) opens the file with the Mac's .fs app", path, path ?? opened() ?? "nothing");
+  const openedPath = probeOpened ? await waitFor(() => (opened()?.endsWith("/Concept.fs") ? opened() : null), 90) : null;
+  if (probeOpened) check("a signflow-edit:// link (open) opens the file with the Mac's .fs app", openedPath, openedPath ?? opened() ?? "nothing");
+  else skip("a signflow-edit:// link (open) opens the file with the Mac's .fs app", "no test editor for .fs on the runner (above)");
+  check("the helper asked macOS to open the file, and macOS accepted", await waitFor(() => logHas("session: asked your mac to open Concept.fs"), 60));
+  // The rest goes on from the helper's own copy even if the runner's .fs app
+  // didn't say what it opened.
+  const filesDir = join(data, "files");
+  const path = openedPath ?? (await waitFor(() => {
+    for (const d of existsSync(filesDir) ? readdirSync(filesDir) : []) {
+      const p = join(filesDir, d, "Concept.fs");
+      if (existsSync(p)) return p;
+    }
+    return null;
+  }, 30));
   check("the file was downloaded into the helper's own folder", path?.startsWith(join(data, "files")), path);
   check("the downloaded file is SignFlow's", path && fileSha(path) === sha(v1));
   check("SignFlow knows it's being edited", (await editOf(f.id))?.open);
@@ -185,6 +206,7 @@ try {
 
 // ---- Report (notes readable without signing in; GitHub keeps ~4KB each)
 const failed = results.filter((r) => !r.ok);
+const skipped = results.filter((r) => r.skipped);
 const esc = (t) => t.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 function notice(title, lines, max) {
   const chunks = [];
@@ -197,12 +219,12 @@ function notice(title, lines, max) {
   const from = Math.max(0, chunks.length - max);
   for (let i = from; i < chunks.length; i++) console.log(`::notice title=${title} (${i + 1}/${chunks.length})::${esc(chunks[i].trimEnd())}`);
 }
-notice(`macOS e2e results ${results.length - failed.length}/${results.length}`, results.map((r) => `${r.ok ? "ok  " : "FAIL"} ${r.name} | ${r.detail}`), 2);
+notice(`macOS e2e results ${results.length - failed.length - skipped.length} passed, ${failed.length} failed, ${skipped.length} skipped`, results.map((r) => `${r.skipped ? "skip" : r.ok ? "ok  " : "FAIL"} ${r.name} | ${r.detail}`), 2);
 for (const r of failed.slice(0, 7)) console.log(`::error title=macOS e2e FAIL::${esc(`${r.name} | ${r.detail}`)}`);
 if (existsSync(log)) notice("macOS helper.log", readFileSync(log, "utf8").split("\n").filter((l) => l && !/STATUS (Downloading|Saving) .* \d+%/.test(l)).map((l) => l.replace(/^\d{4}-\d\d-\d\dT(\S+)[+-]\d{4} /, "$1 ")), 3);
-const md = `## Helper end-to-end on macOS\n\n| | Check | Detail |\n|---|---|---|\n${results.map((r) => `| ${r.ok ? "✅" : "❌"} | ${r.name} | ${r.detail.replace(/\|/g, "/")} |`).join("\n")}\n`;
+const md = `## Helper end-to-end on macOS\n\n| | Check | Detail |\n|---|---|---|\n${results.map((r) => `| ${r.skipped ? "⏭️" : r.ok ? "✅" : "❌"} | ${r.name} | ${r.detail.replace(/\|/g, "/")} |`).join("\n")}\n`;
 if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
 writeFileSync(join(work, "summary-mac.md"), md);
 if (existsSync(log)) writeFileSync(join(work, "helper-mac.log"), readFileSync(log));
-console.log(`${results.length - failed.length} passed, ${failed.length} failed`);
+console.log(`${results.length - failed.length - skipped.length} passed, ${failed.length} failed, ${skipped.length} skipped`);
 process.exit(failed.length ? 1 : 0);

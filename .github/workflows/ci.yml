@@ -143,10 +143,10 @@ jobs:
           code=${PIPESTATUS[0]}
           set -e
           passed=$(grep -Eo '^test result: ok\. [0-9]+ passed' ../unit-tests-mac.log | grep -Eo '[0-9]+' | paste -sd+ - | bc)
-          watch=$(grep -Eo '\[watcher\].*$' ../unit-tests-mac.log | sed ':a;N;$!ba;s/\n/%0A/g')
+          watch=$(grep -Eo '\[watcher\].*$' ../unit-tests-mac.log | awk 'BEGIN{ORS="%0A"} {print}')
           echo "::notice title=macOS unit tests::exit $code, ${passed:-0} passed%0A%0Asave watcher against a fake editor:%0A$watch"
           if [ "$code" != "0" ]; then
-            tail=$(grep -E 'error|panicked|FAILED|failures|assert' ../unit-tests-mac.log | tail -40 | sed ':a;N;$!ba;s/\n/%0A/g')
+            tail=$(grep -E 'error|panicked|FAILED|failures|assert' ../unit-tests-mac.log | tail -40 | awk 'BEGIN{ORS="%0A"} {print}')
             echo "::error title=macOS unit tests failed::$tail"
             exit "$code"
           fi
@@ -165,7 +165,7 @@ jobs:
           code=${PIPESTATUS[0]}
           set -e
           if [ "$code" != "0" ]; then
-            tail=$(grep -E -A6 'error|Error' build-e2e-mac.log | tail -30 | sed ':a;N;$!ba;s/\n/%0A/g')
+            tail=$(grep -E -A6 'error|Error' build-e2e-mac.log | tail -30 | awk 'BEGIN{ORS="%0A"} {print}')
             echo "::error title=macOS e2e build failed::$tail"
             exit 1
           fi
@@ -183,7 +183,7 @@ jobs:
           code=${PIPESTATUS[0]}
           set -e
           if [ "$code" != "0" ]; then
-            tail=$(grep -E -A6 'error|Error' build-release-mac.log | tail -30 | sed ':a;N;$!ba;s/\n/%0A/g')
+            tail=$(grep -E -A6 'error|Error' build-release-mac.log | tail -30 | awk 'BEGIN{ORS="%0A"} {print}')
             echo "::error title=macOS release build failed::$tail"
             exit 1
           fi

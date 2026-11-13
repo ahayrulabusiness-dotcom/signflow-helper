@@ -190,7 +190,7 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
         }
     }
 
-    // 3. Open it in Flexi.
+    // 3. Open it in Flexi (on a Mac, in the app the Mac uses for it).
     if let Err(e) = (ctx.open)(&local.path) {
         log::warn(&format!("session: couldn't open the file: {e}"));
         ui.tell(&format!(
@@ -199,6 +199,8 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
             words::SET_UP_EDITOR,
             local.path.display()
         ));
+    } else {
+        log::info(&format!("session: asked {} to open {name} with its app for .fs files", words::COMPUTER.to_lowercase()));
     }
     ui.editing(Some((&local.path, &name)));
     ui.status(&format!("Editing {}", file_label(&name)));

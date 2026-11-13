@@ -367,6 +367,17 @@ pub fn run() {
                 items,
             });
 
+            // macOS runs an app opened straight from the .dmg or Downloads from
+            // a temporary read-only copy: links and updates can't reach it there.
+            #[cfg(target_os = "macos")]
+            if let Ok(exe) = std::env::current_exe() {
+                let p = exe.to_string_lossy();
+                if p.contains("/AppTranslocation/") || p.starts_with("/Volumes/") {
+                    logfile::warn("running from outside Applications (translocated or on the .dmg)");
+                    ui_of(&handle).tell("Drag SignFlow Helper into your Applications folder, then open it from there. Links from SignFlow only reach it in Applications.");
+                }
+            }
+
             // Later links (forwarded from a second launch).
             let h = handle.clone();
             app.deep_link().on_open_url(move |event| {

@@ -3,7 +3,7 @@
 # applet that claims .fs (through its own exported type), registered with
 # Launch Services, and that writes each file it is asked to open into
 # <opened.txt>. Runner only.
-#   e2e/mac/make-fake-editor.sh <opened.txt>
+#   e2e/mac/make-fake-editor.sh <opened.txt> <a probe .fs path>
 set -euo pipefail
 OPENED="$1"
 APP="/Applications/SignFlowE2E Editor.app"
@@ -28,7 +28,9 @@ $PB -c "Add :CFBundleDocumentTypes array" \
     -c "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Editor" \
     -c "Add :CFBundleDocumentTypes:0:LSHandlerRank string Owner" \
     -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes array" \
-    -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string com.signflow.e2e.fs" "$PL"
+    -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string com.signflow.e2e.fs" \
+    -c "Add :CFBundleDocumentTypes:0:CFBundleTypeExtensions array" \
+    -c "Add :CFBundleDocumentTypes:0:CFBundleTypeExtensions:0 string fs" "$PL"
 $PB -c "Delete :UTExportedTypeDeclarations" "$PL" 2>/dev/null || true
 $PB -c "Add :UTExportedTypeDeclarations array" \
     -c "Add :UTExportedTypeDeclarations:0 dict" \
@@ -41,12 +43,24 @@ $PB -c "Add :UTExportedTypeDeclarations array" \
     -c "Add :UTExportedTypeDeclarations:0:UTTypeTagSpecification:public.filename-extension:0 string fs" "$PL"
 codesign --force --deep --sign - "$APP"
 "$LSREG" -f "$APP"
-# Make it the default for that type too (the runner may have another .fs app,
-# e.g. for F# files). Best effort: the run checks the result itself.
+# Make it the default for whatever type this Mac gives .fs files (the runner
+# may already have an app for .fs, e.g. for F# source), and for its own type.
+# Best effort: the run checks the result itself.
 cat > "$SRC/default.swift" <<'EOS'
+import AppKit
 import CoreServices
-let r = LSSetDefaultRoleHandlerForContentType("com.signflow.e2e.fs" as CFString, .all, "com.signflow.e2e.editor" as CFString)
-print("set default handler for .fs:", r)
+import UniformTypeIdentifiers
+var types = ["com.signflow.e2e.fs"]
+if let t = UTType(filenameExtension: "fs") { types.append(t.identifier) }
+for t in Set(types) {
+  let r = LSSetDefaultRoleHandlerForContentType(t as CFString, .all, "com.signflow.e2e.editor" as CFString)
+  print("default handler for \(t): \(r == 0 ? "set" : "error \(r)")")
+}
+let probe = URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "/tmp/probe.fs")
+print("a .fs file is type:", UTType(filenameExtension: "fs")?.identifier ?? "none")
+print("opens with:", NSWorkspace.shared.urlForApplication(toOpen: probe)?.path ?? "nothing")
 EOS
-swift "$SRC/default.swift" || echo "could not set the default handler"
+touch "$2"
+# macOS 26.4+ may ask before a default app changes; never wait on that.
+perl -e 'alarm 90; exec @ARGV' swift "$SRC/default.swift" "$2" || echo "could not set the default handler (or it timed out)"
 echo "fake editor ready: $APP"
