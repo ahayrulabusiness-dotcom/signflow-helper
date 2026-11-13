@@ -78,7 +78,12 @@ jobs:
         working-directory: src-tauri
         run: |
           cargo test --color never --features e2e -- --test-threads 1 2>&1 | Tee-Object -FilePath ../unit-tests-e2e.log
-          if ($LASTEXITCODE -ne 0) {
+          $code = $LASTEXITCODE
+          $passed = ((Select-String -Path ../unit-tests-e2e.log -Pattern '^test result: ok\. (\d+) passed' -AllMatches).Matches | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Sum).Sum
+          # The tests that exist only in the e2e build (its test-file reading).
+          $own = (Select-String -Path ../unit-tests-e2e.log -Pattern '^test (e2e_files::\S+) \.\.\. (\w+)').Matches | ForEach-Object { "$($_.Groups[1].Value): $($_.Groups[2].Value)" }
+          Write-Host "::notice title=unit tests (e2e build's settings)::exit $code, $passed passed%0Aonly in the e2e build:%0A$($own -join '%0A')"
+          if ($code -ne 0) {
             $tail = (Get-Content ../unit-tests-e2e.log | Select-Object -Last 40) -join "%0A"
             Write-Host "::error title=unit tests (e2e features) failed::$tail"
             exit 1
@@ -227,7 +232,19 @@ jobs:
 
       - name: Unit tests with the e2e build's settings (macOS)
         working-directory: src-tauri
-        run: cargo test --color never --features e2e -- --test-threads 1
+        run: |
+          set +e
+          cargo test --color never --features e2e -- --test-threads 1 2>&1 | tee ../unit-tests-e2e-mac.log
+          code=${PIPESTATUS[0]}
+          set -e
+          passed=$(grep -Eo '^test result: ok\. [0-9]+ passed' ../unit-tests-e2e-mac.log | grep -Eo '[0-9]+' | paste -sd+ - | bc)
+          # The tests that exist only in the e2e build (its test-file reading).
+          own=$( (grep -E '^test e2e_files::' ../unit-tests-e2e-mac.log || true) | awk 'BEGIN{ORS="%0A"} {print $2": "$4}')
+          echo "::notice title=macOS unit tests (e2e build's settings)::exit $code, ${passed:-0} passed%0Aonly in the e2e build:%0A$own"
+          if [ "$code" != "0" ]; then
+            echo "::error title=macOS unit tests (e2e features) failed::$(tail -40 ../unit-tests-e2e-mac.log | awk 'BEGIN{ORS="%0A"} {print}')"
+            exit 1
+          fi
 
       - name: Build the e2e app and .dmg (talks to the stand-ins on 127.0.0.1)
         env:
