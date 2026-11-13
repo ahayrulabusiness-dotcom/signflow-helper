@@ -93,7 +93,9 @@ try {
   const probeOpened = await waitFor(() => (opened() === probe ? probe : null), 30);
   const editorSetup = setup.split("\n").filter((l) => /default handler|type:|opens with|error|timed out|open probe/.test(l)).join(" / ");
   if (probeOpened) check("the stand-in editor opens .fs files on this Mac (the runner's own setup)", true, editorSetup);
-  else skip("the stand-in editor opens .fs files on this Mac (the runner's own setup)", `couldn't be set up on the runner: macOS types .fs as a file-system plug-in | ${editorSetup}`);
+  // On the runner .fs belongs to another app (Xcode, as a shader file), and
+  // macOS 26.4+ asks a person before changing a default app.
+  else skip("the stand-in editor opens .fs files on this Mac (the runner's own setup)", `the runner wouldn't hand .fs to a test editor | ${editorSetup}`);
 
   // ---- Install from the .dmg into /Applications
   rmSync(APP, { recursive: true, force: true });

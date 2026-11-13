@@ -10,6 +10,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
+    # A dry run: everything (tests, both builds, signing, latest.json) except
+    # making the release.
+    branches: ["release-dryrun"]
   workflow_dispatch:
 
 permissions:
@@ -216,6 +219,12 @@ jobs:
             fs.writeFileSync("dist/latest.json", JSON.stringify(latest, null, 2) + "\n");
           '
           ls -l dist
+          if [ "$GITHUB_REF_TYPE" != "tag" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            for f in dist/*; do echo "::notice title=dry run file::$(basename "$f"), $(stat -c%s "$f") bytes"; done
+            echo "::notice title=dry run latest.json::$(sed 's/"signature": "[^"]*"/"signature": "…"/' dist/latest.json | awk 'BEGIN{ORS="%0A"} {print}')"
+            echo "::notice title=dry run::No release made (branch $GITHUB_REF_NAME)."
+            exit 0
+          fi
           files=(dist/*)
           existing=$(gh release view "$tag" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)
           if [ "$existing" = "false" ]; then
