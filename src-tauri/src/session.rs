@@ -10,7 +10,12 @@
 //!     one-file token, ask SignFlow to make it the new version. If somebody
 //!     saved a newer one meanwhile, she chooses: keep theirs, upload mine as
 //!     newest, or save mine as a copy.
-//!  6. Done: a last save if there is one, then SignFlow ends the edit.
+//!  6. Done: a last save if there is one, then SignFlow ends the edit. But
+//!     Done on an unchanged file that's still open in its program (Flexi for
+//!     Mac writes the file only when it closes) doesn't end it: the edit stays
+//!     open — watched, checked in, locked — until the program lets go. Then
+//!     a change is uploaded and the edit ends on its own ("Saved to
+//!     SignFlow"), or she chooses "Finish without saving".
 //!
 //! Safe failure: with no answer it keeps the file and tries again; it never
 //! deletes her file and never uploads anything but this one file.
@@ -38,7 +43,102 @@ pub trait Ui: Send + Sync {
     fn ask(&self, question: Question) -> oneshot::Receiver<Option<Choice>>;
     /// The file being edited, or None when the edit ends.
     fn editing(&self, file: Option<(&Path, &str)>);
+    /// The window after Done while the file is still open in its program:
+    /// waiting, then saved or closed unchanged. None closes it.
+    fn finishing(&self, step: Option<Finish>);
 }
+
+/// What the window after Done says (finish_words).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finish {
+    /// Done, but the file is still open in its program: waiting for it.
+    Waiting { name: String },
+    /// It was saved and let go: uploaded, and the edit ended on its own.
+    Saved { name: String },
+    /// It was let go without a change: nothing uploaded, the edit ended.
+    Unchanged { name: String },
+}
+
+/// The window's words: a title, a message, and its buttons as
+/// (label, what it does) — the main one, then the other.
+pub struct FinishWords {
+    pub title: String,
+    pub message: String,
+    pub primary: (&'static str, &'static str),
+    pub secondary: Option<(&'static str, &'static str)>,
+}
+
+pub fn finish_words(step: &Finish) -> FinishWords {
+    match step {
+        Finish::Waiting { name } => FinishWords {
+            title: "Waiting for Flexi".into(),
+            message: format!("Save {name} in Flexi and close it. SignFlow Edit will upload it when Flexi lets go."),
+            primary: ("Keep waiting", "keep-waiting"),
+            secondary: Some(("Finish without saving", "finish-without-saving")),
+        },
+        Finish::Saved { name } => FinishWords {
+            title: "Saved to SignFlow".into(),
+            message: format!("{name} is in SignFlow now. The edit is finished."),
+            primary: ("OK", "ok"),
+            secondary: None,
+        },
+        Finish::Unchanged { name } => FinishWords {
+            title: "Nothing to upload".into(),
+            message: format!("{name} was closed without changes, so nothing was uploaded. The edit is finished."),
+            primary: ("OK", "ok"),
+            secondary: None,
+        },
+    }
+}
+
+/// Told to a link that arrives while the file being edited is still open.
+pub const SAVE_AND_CLOSE_FIRST: &str = "Save in Flexi and close it first, then open the next file.";
+
+/// What Done does now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtDone {
+    /// A change is waiting: upload it, then end (as always).
+    Upload,
+    /// Unchanged, and still open in its program: wait for it.
+    Wait,
+    /// Unchanged and let go: end.
+    End,
+}
+
+pub fn at_done(changed: bool, still_open: bool) -> AtDone {
+    if changed {
+        AtDone::Upload
+    } else if still_open {
+        AtDone::Wait
+    } else {
+        AtDone::End
+    }
+}
+
+/// While waiting after Done, each look at the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtLook {
+    /// Still open in its program.
+    KeepWaiting,
+    /// Let go with a change not in SignFlow yet: upload it.
+    Upload,
+    /// Let go, and everything is in SignFlow: end ("Saved to SignFlow" when
+    /// something was uploaded while waiting).
+    End { uploaded: bool },
+}
+
+pub fn at_look(still_open: bool, changed: bool, uploaded: bool) -> AtLook {
+    if still_open {
+        AtLook::KeepWaiting
+    } else if changed {
+        AtLook::Upload
+    } else {
+        AtLook::End { uploaded }
+    }
+}
+
+/// How often it looks while waiting after Done.
+const FINISH_LOOK: Duration = Duration::from_secs(2);
 
 /// What the stale window says.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +163,10 @@ pub enum Control {
     Done,
     OpenFile,
     ShowFolder,
+    /// The window after Done: go on waiting for the program to let go.
+    KeepWaiting,
+    /// The window after Done: end the edit, nothing uploaded.
+    FinishWithoutSaving,
 }
 
 pub struct Ctx {
@@ -83,8 +187,13 @@ pub struct Ctx {
 pub enum Ended {
     /// The pass didn't work (used, expired, invalid…): SignFlow's sentence.
     PassRefused(String),
-    /// Done in the tray.
+    /// Done in the tray (or "Finish without saving").
     Done,
+    /// After Done, the program let go of a changed file: it was uploaded and
+    /// the edit ended on its own.
+    SavedAfterDone,
+    /// After Done, the program let go without a change: nothing uploaded.
+    ClosedUnchanged,
     /// SignFlow ended the edit (a release, the job, access…).
     EndedBySignFlow(String),
     /// "Keep theirs": her copy stays here; the edit ends.
@@ -222,6 +331,9 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
     tokio::spawn(watcher::watch_file(local.path.clone(), notes.saved_hash.clone(), ctx.timing, save_tx, watch_stop));
 
     let mut retry_at: Option<tokio::time::Instant> = if pending.is_some() { Some(tokio::time::Instant::now()) } else { None };
+    // After Done while the file is still open in its program: waiting for the
+    // program to let go (Some), and whether a save was uploaded meanwhile.
+    let mut finishing: Option<bool> = None;
     let ended = loop {
         let wake = retry_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
         tokio::select! {
@@ -235,10 +347,42 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
                 retry_at = None;
                 if pending.is_some() {
                     match save(&ctx, &key, &local, &name, &mut notes, &mut pending, ask_first).await {
-                        SaveOutcome::Saved | SaveOutcome::Waiting => { ask_first = false; }
+                        SaveOutcome::Saved => {
+                            ask_first = false;
+                            if finishing.is_some() {
+                                finishing = Some(true);
+                            }
+                        }
+                        SaveOutcome::Waiting => { ask_first = false; }
                         SaveOutcome::Retry => { retry_at = Some(tokio::time::Instant::now() + ctx.retry_after); }
                         SaveOutcome::Ended(e) => break e,
                     }
+                }
+            }
+            // Waiting after Done: has the program let go of the file?
+            _ = tokio::time::sleep(FINISH_LOOK), if finishing.is_some() => {
+                let open = still_open(&local.path).await.is_some();
+                if !open {
+                    if let Some(h) = changed_from(&local.path, &notes.saved_hash).await {
+                        pending = Some(h);
+                    }
+                }
+                match at_look(open, pending.is_some(), finishing == Some(true)) {
+                    AtLook::KeepWaiting => {}
+                    // A try is already set for later (SignFlow didn't answer).
+                    AtLook::Upload if retry_at.is_some() => {}
+                    AtLook::Upload => {
+                        log::info(&format!("done: {name} was saved and let go; uploading it"));
+                        match save(&ctx, &key, &local, &name, &mut notes, &mut pending, ask_first).await {
+                            SaveOutcome::Saved => break Ended::SavedAfterDone,
+                            // She closed the question without choosing: as Done always did.
+                            SaveOutcome::Waiting => break Ended::Done,
+                            SaveOutcome::Retry => { retry_at = Some(tokio::time::Instant::now() + ctx.retry_after); }
+                            SaveOutcome::Ended(e) => break e,
+                        }
+                    }
+                    AtLook::End { uploaded: true } => break Ended::SavedAfterDone,
+                    AtLook::End { uploaded: false } => break Ended::ClosedUnchanged,
                 }
             }
             Some(msg) = end_rx.recv() => {
@@ -247,11 +391,47 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
             c = control.recv() => match c {
                 Some(Control::OpenFile) => { if let Err(e) = (ctx.open)(&local.path) { ui.tell(&format!("{} couldn't open {name}: {e}", words::COMPUTER)); } }
                 Some(Control::ShowFolder) => { let _ = (ctx.reveal)(&local.path); }
-                Some(Control::Done) | None => {
+                Some(Control::KeepWaiting) => {
+                    if finishing.is_some() {
+                        log::info(&format!("done: keep waiting for {name}"));
+                        ui.finishing(None);
+                    }
+                }
+                Some(Control::FinishWithoutSaving) => {
+                    if finishing.is_some() {
+                        log::info(&format!("done: finish without saving {name}"));
+                        break Ended::Done;
+                    }
+                }
+                // Done again while waiting: the window again.
+                Some(Control::Done) if finishing.is_some() => {
+                    ui.finishing(Some(Finish::Waiting { name: name.clone() }));
+                }
+                Some(Control::Done) => {
                     // A last save, if there is one.
-                    let p = local.path.clone();
-                    let last = tokio::task::spawn_blocking(move || watcher::fingerprint(&p).ok()).await.ok().flatten().map(|(h, _)| h);
-                    if let Some(h) = last { if h != notes.saved_hash { pending = Some(h); } }
+                    if let Some(h) = changed_from(&local.path, &notes.saved_hash).await {
+                        pending = Some(h);
+                    }
+                    let open = if pending.is_none() { still_open(&local.path).await } else { None };
+                    match at_done(pending.is_some(), open.is_some()) {
+                        AtDone::Wait => {
+                            log::info(&format!("done: {name} is unchanged and still open ({}); waiting for it to be saved and closed", hold_words(open.as_ref())));
+                            finishing = Some(false);
+                            ui.status(&format!("Waiting for {name} to be saved and closed in Flexi"));
+                            ui.finishing(Some(Finish::Waiting { name: name.clone() }));
+                        }
+                        AtDone::Upload => {
+                            if let SaveOutcome::Ended(e) = save(&ctx, &key, &local, &name, &mut notes, &mut pending, ask_first).await { break e; }
+                            break Ended::Done;
+                        }
+                        AtDone::End => break Ended::Done,
+                    }
+                }
+                // The helper is going away: a last save if there is one, as Done always did.
+                None => {
+                    if let Some(h) = changed_from(&local.path, &notes.saved_hash).await {
+                        pending = Some(h);
+                    }
                     if pending.is_some() {
                         if let SaveOutcome::Ended(e) = save(&ctx, &key, &local, &name, &mut notes, &mut pending, ask_first).await { break e; }
                     }
@@ -264,30 +444,65 @@ pub async fn run(ctx: Arc<Ctx>, pass: String, mut control: mpsc::Receiver<Contro
     let _ = watch_stop_tx.send(true);
     let _ = hb_stop_tx.send(true);
     match &ended {
-        Ended::Done | Ended::KeptTheirs => {
+        Ended::Done | Ended::KeptTheirs | Ended::SavedAfterDone | Ended::ClosedUnchanged => {
             for _ in 0..3 {
                 match ctx.api.done(&key).await {
                     Err(e) if e.is_retryable() => tokio::time::sleep(Duration::from_secs(3)).await,
                     _ => break,
                 }
             }
-            if ended == Ended::Done {
-                let unsaved = pending.is_some();
-                ui.status(if unsaved { "Done — some changes didn't reach SignFlow" } else { "Done" });
-                if unsaved {
-                    ui.tell(&format!("Your latest changes to {name} didn't reach SignFlow. They're safe on this computer: {}", local.path.display()));
+            match &ended {
+                Ended::Done => {
+                    ui.finishing(None);
+                    let unsaved = pending.is_some();
+                    ui.status(if unsaved { "Done — some changes didn't reach SignFlow" } else { "Done" });
+                    if unsaved {
+                        ui.tell(&format!("Your latest changes to {name} didn't reach SignFlow. They're safe on this computer: {}", local.path.display()));
+                    }
                 }
+                Ended::SavedAfterDone => {
+                    ui.status(&format!("Saved to SignFlow at {}", now_hhmm()));
+                    ui.finishing(Some(Finish::Saved { name: name.clone() }));
+                }
+                Ended::ClosedUnchanged => {
+                    ui.status("Done — nothing was changed");
+                    ui.finishing(Some(Finish::Unchanged { name: name.clone() }));
+                }
+                _ => ui.finishing(None),
             }
         }
         Ended::EndedBySignFlow(msg) => {
+            ui.finishing(None);
             ui.status("Not editing");
             ui.tell(&format!("{msg} Your file is still on this computer: {}", local.path.display()));
         }
-        _ => {}
+        _ => ui.finishing(None),
     }
     ui.editing(None);
     log::info(&format!("session: ended: {ended:?}"));
     ended
+}
+
+/// Whether the file is still open in its program (watcher::editor_holds),
+/// off the async threads.
+async fn still_open(path: &Path) -> Option<watcher::Hold> {
+    let p = path.to_path_buf();
+    tokio::task::spawn_blocking(move || watcher::editor_holds(&p)).await.ok().flatten()
+}
+
+/// The file's fingerprint when it isn't `saved` (what's in SignFlow).
+async fn changed_from(path: &Path, saved: &str) -> Option<String> {
+    let p = path.to_path_buf();
+    let (hash, _) = tokio::task::spawn_blocking(move || watcher::fingerprint(&p).ok()).await.ok().flatten()?;
+    (hash != saved).then_some(hash)
+}
+
+fn hold_words(hold: Option<&watcher::Hold>) -> String {
+    match hold {
+        Some(watcher::Hold::OpenInProgram) => "a program has it open".into(),
+        Some(watcher::Hold::AppRunning(id)) => format!("{id} is running"),
+        None => "not open".into(),
+    }
 }
 
 /// Downloads the file into place; its fingerprint and SignFlow's version
@@ -550,5 +765,52 @@ async fn heartbeat(ctx: Arc<Ctx>, key: String, name: String, every: Duration, en
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn done_waits_only_for_an_unchanged_file_still_open_in_its_program() {
+        // What went wrong on a Mac: Done before Flexi wrote the file (it writes
+        // only when it closes). Now Done waits for it.
+        assert_eq!(at_done(false, true), AtDone::Wait);
+        // As always: a change is uploaded, then the edit ends.
+        assert_eq!(at_done(true, false), AtDone::Upload);
+        assert_eq!(at_done(true, true), AtDone::Upload);
+        // As always: nothing changed and nothing has it, so the edit ends.
+        assert_eq!(at_done(false, false), AtDone::End);
+    }
+
+    #[test]
+    fn while_waiting_the_edit_ends_only_once_the_program_lets_go() {
+        // Still open: keep waiting, whatever happened to the file.
+        assert_eq!(at_look(true, false, false), AtLook::KeepWaiting);
+        assert_eq!(at_look(true, true, false), AtLook::KeepWaiting);
+        assert_eq!(at_look(true, false, true), AtLook::KeepWaiting);
+        // Let go with a change not in SignFlow: upload it (then the edit ends).
+        assert_eq!(at_look(false, true, false), AtLook::Upload);
+        assert_eq!(at_look(false, true, true), AtLook::Upload);
+        // Let go, all in SignFlow: "Saved to SignFlow" if it was uploaded while waiting…
+        assert_eq!(at_look(false, false, true), AtLook::End { uploaded: true });
+        // …or closed without a change: nothing uploaded.
+        assert_eq!(at_look(false, false, false), AtLook::End { uploaded: false });
+    }
+
+    #[test]
+    fn the_window_after_done_says_what_to_do_in_plain_words() {
+        let w = finish_words(&Finish::Waiting { name: "JAMESBURG LIBRARY FLEXI.fs".into() });
+        assert_eq!(w.title, "Waiting for Flexi");
+        assert_eq!(w.message, "Save JAMESBURG LIBRARY FLEXI.fs in Flexi and close it. SignFlow Edit will upload it when Flexi lets go.");
+        assert_eq!(w.primary, ("Keep waiting", "keep-waiting"));
+        assert_eq!(w.secondary, Some(("Finish without saving", "finish-without-saving")));
+        let s = finish_words(&Finish::Saved { name: "Lobby sign.fs".into() });
+        assert_eq!((s.title.as_str(), s.message.as_str(), s.primary, s.secondary), ("Saved to SignFlow", "Lobby sign.fs is in SignFlow now. The edit is finished.", ("OK", "ok"), None));
+        let u = finish_words(&Finish::Unchanged { name: "Lobby sign.fs".into() });
+        assert_eq!(u.title, "Nothing to upload");
+        assert_eq!(u.message, "Lobby sign.fs was closed without changes, so nothing was uploaded. The edit is finished.");
+        assert_eq!(SAVE_AND_CLOSE_FIRST, "Save in Flexi and close it first, then open the next file.");
     }
 }

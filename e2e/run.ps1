@@ -254,6 +254,107 @@ Check "the helper never held the file in memory (peak under 150MB)" ($peakMB -lt
 Check "it went in parts" ([bool]((State).events | Where-Object { $_.what -eq "blob multipart" -and $_.size -eq 524288000 }))
 Check "the tray reported upload progress" (LogHas "STATUS Saving Big.fs to SignFlow")
 Tell "done" "e2e-control.txt"
+$bigDone = WaitFor { $e = EditOf $big.id; if (-not $e.open) { $e } } 120
+Check "the big file's Done ends its edit" ($bigDone -and $bigDone.closedReason -eq "done") "$($bigDone.closedReason)"
+
+# ---- Done before the file is saved: Flexi may write the file only when it
+# closes, so Done on an unchanged file that's still open waits for it.
+function OpenFresh([string]$name, [byte[]]$content) {
+  $file = Admin file @{ name = $name; content = (B64 $content) }
+  Remove-Item -Force "$work\opened.txt" -ErrorAction SilentlyContinue
+  OpenLink (Admin pass @{ fileId = $file.id; user = "carlee" }).pass
+  $path = WaitFor { $o = Opened; if ($o -like "*\$name") { $o } } 90
+  $open = WaitFor { $e = EditOf $file.id; if ($e.open) { $e } } 60
+  return [pscustomobject]@{ file = $file; path = $path; open = [bool]$open }
+}
+# Whether some program has the file open (it can't be opened unshared).
+function IsHeld([string]$path) { try { $h = [IO.File]::Open($path, "Open", "Read", "None"); $h.Close(); $false } catch { $true } }
+# A stand-in Flexi holding the file open; LetGo makes it write $writeOnClose (if any) and close it.
+function HoldOpen([string]$path, [byte[]]$writeOnClose) {
+  $sig = Join-Path $work ("let-go-" + [guid]::NewGuid().ToString("N"))
+  $argList = @("-NoProfile", "-File", "`"$PSScriptRoot\hold-file.ps1`"", "-Path", "`"$path`"", "-Signal", "`"$sig`"")
+  if ($writeOnClose) { [IO.File]::WriteAllBytes("$sig.content", $writeOnClose); $argList += @("-NewContent", "`"$sig.content`"") }
+  $proc = Start-Process pwsh -ArgumentList $argList -PassThru -WindowStyle Hidden
+  WaitFor { IsHeld $path } 30 | Out-Null
+  return [pscustomobject]@{ proc = $proc; sig = $sig }
+}
+function LetGo($holder) { New-Item -ItemType File -Force $holder.sig | Out-Null; $holder.proc.WaitForExit(30000) | Out-Null }
+function Window([string]$action, [string]$waitFor) {
+  $out = (node "$PSScriptRoot\click-finish.mjs" 9223 $action $waitFor 2>&1 | Out-String)
+  try { ($out -split "`n" | Where-Object { $_ -like "{*" } | Select-Object -Last 1) | ConvertFrom-Json } catch { [pscustomobject]@{ error = $out.Trim() } }
+}
+function ClosedEdit([string]$id, [int]$seconds) { WaitFor { $e = EditOf $id; if (-not $e.open) { $e } } $seconds }
+function CheckIns([string]$id) { @((State).events | Where-Object { $_.what -eq "heartbeat" -and $_.fileId -eq $id }).Count }
+function Replaced([string]$id) { @((State).events | Where-Object { $_.what -eq "replaced" -and $_.fileId -eq $id }).Count }
+
+# Done after a normal save: as before, the save goes up and the edit ends.
+$n = OpenFresh "Normal.fs" (Bytes "Normal, version 1")
+Check "normal save: the file opened" ($n.path -and $n.open) "$($n.path)"
+$nv2 = Bytes "Normal, version 2 $(Get-Random)"
+SaveLikeFlexi $n.path $nv2
+Tell "done" "e2e-control.txt"
+$nd = ClosedEdit $n.file.id 60
+Check "Done after a normal save: the save reaches SignFlow" ((FileRow $n.file.id).sha256 -eq (Sha $nv2))
+Check "…and Done ends the edit at once, with no waiting" ($nd -and $nd.closedReason -eq "done" -and -not (LogHas "done: Normal.fs is unchanged and still open")) "$($nd.closedReason)"
+
+# Still open in Flexi, unchanged: Done waits; Flexi writes the file 14 seconds
+# later as it closes; it's uploaded and the edit ends on its own.
+$h = OpenFresh "Held.fs" (Bytes "Held, version 1")
+Check "held: the file opened" ($h.path -and $h.open) "$($h.path)"
+$hv2 = Bytes ("Held, saved as Flexi closed " + (Get-Random))
+$holder = HoldOpen $h.path $hv2
+Check "held: (stand-in) Flexi has the file open" (IsHeld $h.path)
+$hb0 = CheckIns $h.file.id
+Tell "done" "e2e-control.txt"
+$doneAt = Get-Date
+Check "Done with the file unchanged and still open: it waits instead of ending" (WaitFor { LogHas "done: Held.fs is unchanged and still open (a program has it open)" } 30)
+$w = Window read "Waiting for Flexi"
+Check "the window: 'Save Held.fs in Flexi and close it. SignFlow Edit will upload it when Flexi lets go.'" ($w.title -eq "Waiting for Flexi" -and $w.message -eq "Save Held.fs in Flexi and close it. SignFlow Edit will upload it when Flexi lets go.") "$($w.title) / $($w.message) $($w.error)"
+Check "the window's buttons: Finish without saving, Keep waiting" ((@($w.buttons) -join "|") -eq "Finish without saving=finish-without-saving|Keep waiting=keep-waiting") "$(@($w.buttons) -join ' | ')"
+Check "the tray says it's waiting" (LogHas "STATUS Waiting for Held.fs to be saved and closed in Flexi")
+$k = Window keep-waiting "Waiting for Flexi"
+Check "clicking 'Keep waiting': the window closes, the edit stays open" ((WaitFor { LogHas "FINISH answered in the window: keep-waiting" } 20) -and (WaitFor { LogHas "done: keep waiting for Held.fs" } 20) -and (EditOf $h.file.id).open) "$($k.clickError)"
+$other = Admin file @{ name = "Other.fs"; content = (B64 (Bytes "Other")) }
+OpenLink (Admin pass @{ fileId = $other.id; user = "carlee" }).pass
+Check "a link while the file is still open: 'Save in Flexi and close it first, then open the next file.'" (WaitFor { LogHas "TELL Save in Flexi and close it first, then open the next file." } 30)
+$left = 14 - ((Get-Date) - $doneAt).TotalSeconds
+if ($left -gt 0) { Start-Sleep -Milliseconds ([int]($left * 1000)) }
+$hb1 = CheckIns $h.file.id
+Check "while it waits the edit stays open and keeps checking in, so the lock holds" ((EditOf $h.file.id).open -and $hb1 -gt $hb0) "$hb0 → $hb1 check-ins in $([int]((Get-Date) - $doneAt).TotalSeconds)s"
+Check "nothing is uploaded while it waits" (((FileRow $h.file.id).sha256 -eq (Sha (Bytes "Held, version 1"))) -and (Replaced $h.file.id) -eq 0)
+LetGo $holder
+$hUp = WaitFor { $r = FileRow $h.file.id; if ($r.sha256 -eq (Sha $hv2)) { $r } } 60
+Check "14 seconds after Done Flexi writes the file and lets go: it's uploaded" ([bool]$hUp) "written $([int]((Get-Date) - $doneAt).TotalSeconds)s after Done"
+$he = ClosedEdit $h.file.id 30
+Check "…and the edit ends on its own" ($he -and $he.closedReason -eq "done" -and (LogHas "session: ended: SavedAfterDone")) "$($he.closedReason)"
+$sv = Window read "Saved to SignFlow"
+Check "it says 'Saved to SignFlow'" ($sv.title -eq "Saved to SignFlow" -and $sv.message -eq "Held.fs is in SignFlow now. The edit is finished." -and (LogHas "STATUS Saved to SignFlow at")) "$($sv.title) / $($sv.message) $($sv.error)"
+Window ok "Saved to SignFlow" | Out-Null
+
+# Finish without saving: nothing uploaded, the edit ends.
+$fw = OpenFresh "Finish.fs" (Bytes "Finish, version 1")
+$fh = HoldOpen $fw.path $null
+Tell "done" "e2e-control.txt"
+Check "Finish without saving: Done waits first" (WaitFor { LogHas "done: Finish.fs is unchanged and still open" } 30)
+$c = Window finish-without-saving "Waiting for Flexi"
+$fe = ClosedEdit $fw.file.id 30
+Check "clicking 'Finish without saving' ends the edit…" ($fe -and $fe.closedReason -eq "done" -and (LogHas "done: finish without saving Finish.fs")) "$($fe.closedReason) $($c.clickError)"
+Check "…with nothing uploaded" (((FileRow $fw.file.id).sha256 -eq (Sha (Bytes "Finish, version 1"))) -and (Replaced $fw.file.id) -eq 0)
+LetGo $fh
+
+# The next file, once the open one is saved and closed: that edit finishes, the next opens.
+$first = OpenFresh "First.fs" (Bytes "First")
+# She saves and closes Flexi, then opens the next file (a moment later, as a
+# person would; a virus scan of the new file can hold it for an instant).
+Start-Sleep -Seconds 3
+$second = Admin file @{ name = "Second.fs"; content = (B64 (Bytes "Second")) }
+Remove-Item -Force "$work\opened.txt" -ErrorAction SilentlyContinue
+OpenLink (Admin pass @{ fileId = $second.id; user = "carlee" }).pass
+$fc = ClosedEdit $first.file.id 60
+Check "a link once the open file is closed: that edit finishes…" ($fc -and $fc.closedReason -eq "done" -and (LogHas "LINK while an edit is open and its file closed")) "$($fc.closedReason)"
+Check "…and the next file opens" ((WaitFor { $o = Opened; if ($o -like "*\Second.fs") { $o } } 90) -and (EditOf $second.id).open)
+Tell "done" "e2e-control.txt"
+Check "…and its Done ends it" ((ClosedEdit $second.id 60).closedReason -eq "done")
 
 # ---- Never anything but the one file
 $uploads = (State).events | Where-Object { $_.what -like "blob*" }

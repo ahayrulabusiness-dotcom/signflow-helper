@@ -92,6 +92,112 @@ pub fn released(path: &Path) -> bool {
     path.exists()
 }
 
+/// Why a file still counts as open in the program editing it, when she
+/// clicks Done (editor_holds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hold {
+    /// Another program has the file itself open.
+    OpenInProgram,
+    /// (macOS) The app this Mac opens the file with is still running. Flexi
+    /// for Mac reads the file, lets go of it, and writes it again only when
+    /// it closes, so the file alone can't say whether it's still being edited.
+    AppRunning(String),
+}
+
+/// Whether the program editing the file still has it — so Done waits for it
+/// to be saved and closed instead of ending the edit. None when nothing has
+/// it (or it can't be told).
+///   Windows: any program has the file open (it can't be opened unshared).
+///   macOS: another program has the file open (lsof), or the app the Mac
+///   uses for this file is running (Launch Services, asked through
+///   osascript's AppKit bridge: no Apple events, so no permission prompt).
+#[cfg(windows)]
+pub fn editor_holds(path: &Path) -> Option<Hold> {
+    use std::os::windows::fs::OpenOptionsExt;
+    if !path.exists() {
+        return None;
+    }
+    // Opened sharing nothing: refused while any program has it open.
+    match std::fs::OpenOptions::new().read(true).share_mode(0).open(path) {
+        Ok(_) => None,
+        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+        Err(e) if matches!(e.raw_os_error(), Some(32) | Some(33)) => Some(Hold::OpenInProgram),
+        Err(_) => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn editor_holds(path: &Path) -> Option<Hold> {
+    if !path.exists() {
+        return None;
+    }
+    if open_by_another_program(path) {
+        return Some(Hold::OpenInProgram);
+    }
+    mac_app_running_for(path).map(Hold::AppRunning)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn editor_holds(_path: &Path) -> Option<Hold> {
+    None
+}
+
+/// Whether a program other than this helper has the file open, in any way.
+#[cfg(target_os = "macos")]
+fn open_by_another_program(path: &Path) -> bool {
+    let me = std::process::id().to_string();
+    match std::process::Command::new("/usr/sbin/lsof").args(["-F", "p", "--"]).arg(path).output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.strip_prefix('p')).any(|pid| pid != me),
+        Err(_) => false,
+    }
+}
+
+/// The bundle id of the app this Mac opens `path` with, when it is running.
+#[cfg(target_os = "macos")]
+fn mac_app_running_for(path: &Path) -> Option<String> {
+    const SCRIPT: &str = r#"ObjC.import("AppKit");
+function run(argv) {
+  const app = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.fileURLWithPath(argv[0]));
+  if (!app || app.isNil()) return "none";
+  const bundle = $.NSBundle.bundleWithURL(app);
+  if (!bundle || bundle.isNil() || bundle.bundleIdentifier.isNil()) return "none";
+  const id = ObjC.unwrap(bundle.bundleIdentifier);
+  return ($.NSRunningApplication.runningApplicationsWithBundleIdentifier(id).count > 0 ? "running " : "stopped ") + id;
+}"#;
+    let out = run_for_at_most(
+        std::process::Command::new("/usr/bin/osascript").args(["-l", "JavaScript", "-e", SCRIPT]).arg(path),
+        Duration::from_secs(5),
+    )?;
+    let id = out.trim().strip_prefix("running ")?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// A command's output, or None if it fails or takes longer than `limit`.
+#[cfg(target_os = "macos")]
+fn run_for_at_most(cmd: &mut std::process::Command, limit: Duration) -> Option<String> {
+    use std::io::Read as _;
+    let mut child = cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut s = String::new();
+                child.stdout.take()?.read_to_string(&mut s).ok()?;
+                return Some(s);
+            }
+            Ok(None) if started.elapsed() < limit => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn same_name(a: &Path, b: &Path) -> bool {
     match (a.file_name(), b.file_name()) {
         (Some(x), Some(y)) => x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy()),
@@ -314,5 +420,42 @@ mod tests {
         assert_eq!(std::fs::read(&r.path).unwrap(), b"version 2");
         let names: Vec<_> = std::fs::read_dir(r.path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names, vec![std::ffi::OsString::from("Concept.fs")]);
+    }
+
+    /// Done waits while the program editing the file still has it.
+    #[test]
+    fn a_file_another_program_holds_open_counts_as_still_being_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        // An extension no app claims, so on a Mac only the file itself decides.
+        let p = dir.path().join("Held.sfhtest");
+        std::fs::write(&p, b"version 1").unwrap();
+        assert_eq!(editor_holds(&p), None, "nobody has it");
+        assert_eq!(editor_holds(&dir.path().join("missing.sfhtest")), None, "a file that isn't there");
+
+        #[cfg(windows)]
+        {
+            // Any open handle counts (Flexi, or here the test itself).
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            assert_eq!(editor_holds(&p), Some(Hold::OpenInProgram));
+            drop(f);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Another program holding it open (this helper's own reads don't count).
+            let mut holder = std::process::Command::new("/bin/sh").args(["-c", "exec 3<>\"$0\"; exec sleep 30"]).arg(&p).spawn().unwrap();
+            let start = Instant::now();
+            while editor_holds(&p).is_none() && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(editor_holds(&p), Some(Hold::OpenInProgram), "held by another program");
+            let _own = std::fs::File::open(&p).unwrap();
+            assert_eq!(editor_holds(&p), Some(Hold::OpenInProgram));
+            holder.kill().unwrap();
+            holder.wait().unwrap();
+            let _ = _own;
+            assert_eq!(editor_holds(&p), None, "the helper's own open file alone doesn't count");
+        }
+        assert_eq!(editor_holds(&p), None, "let go");
+        println!("[watcher] a file held open by another program counts as still being edited; let go, it doesn't");
     }
 }

@@ -10,7 +10,7 @@
 //! open for editing.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,12 +24,14 @@ use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::api::{self, Choice};
-use crate::session::{self, Control, Question, Ui};
+use crate::session::{self, Control, Finish, Question, Ui};
 use crate::update::{self, Phase};
 use crate::{blob, config, link, logfile, watcher};
 
 const TRAY_ID: &str = "signflow-helper";
 const UPDATE_WINDOW: &str = "update";
+/// The window after Done while the file is still open in its program.
+const FINISH_WINDOW: &str = "finish";
 
 /// The Windows e2e build opens WebView2's debugging port so the run can click
 /// the helper's windows. Every window must ask for the same arguments: they
@@ -64,6 +66,14 @@ struct Shared {
     installing: AtomicBool,
     /// The window's last words in the log (so the log isn't one line per %).
     update_said: Mutex<String>,
+    /// The file being edited (its path here), while an edit is open.
+    editing_path: Mutex<Option<PathBuf>>,
+    /// A link that came while an edit was open and its file closed: opened as
+    /// soon as that edit has finished.
+    next_pass: Mutex<Option<String>>,
+    /// The finish window's words now (JSON), and whether it is being built.
+    finish_view: Mutex<Option<String>>,
+    finish_building: AtomicBool,
 }
 
 struct Items {
@@ -210,6 +220,7 @@ impl Ui for TrayUi {
 
     fn editing(&self, file: Option<(&Path, &str)>) {
         let Some(shared) = self.app.try_state::<Shared>() else { return };
+        *shared.editing_path.lock().unwrap() = file.map(|(p, _)| p.to_path_buf());
         let Some(items) = &shared.items else { return };
         let on = file.is_some();
         let _ = items.open.set_enabled(on);
@@ -220,6 +231,101 @@ impl Ui for TrayUi {
             None => "Open the file".into(),
         });
     }
+
+    fn finishing(&self, step: Option<Finish>) {
+        let app = self.app.clone();
+        let Some(shared) = app.try_state::<Shared>() else { return };
+        let Some(step) = step else {
+            *shared.finish_view.lock().unwrap() = None;
+            if let Some(w) = app.get_webview_window(FINISH_WINDOW) {
+                let _ = w.close();
+            }
+            return;
+        };
+        let kind = match &step {
+            Finish::Waiting { .. } => "waiting",
+            Finish::Saved { .. } => "saved",
+            Finish::Unchanged { .. } => "unchanged",
+        };
+        let words = session::finish_words(&step);
+        let buttons = std::iter::once(words.primary).chain(words.secondary).map(|(label, _)| label).collect::<Vec<_>>().join(" / ");
+        logfile::info(&format!("FINISH window shown: {kind}"));
+        logfile::info(&format!("FINISH window says: {} | {} | {buttons}", words.title, words.message));
+        let view = serde_json::json!({
+            "title": words.title,
+            "message": words.message,
+            "primary": [words.primary.0, words.primary.1],
+            "secondary": words.secondary.map(|(label, choice)| [label, choice]),
+        })
+        .to_string();
+        *shared.finish_view.lock().unwrap() = Some(view.clone());
+        if let Some(w) = app.get_webview_window(FINISH_WINDOW) {
+            let _ = w.eval(format!("window.__render && window.__render({view});"));
+            let _ = w.set_focus();
+            return;
+        }
+        if shared.finish_building.swap(true, Ordering::SeqCst) {
+            // Being built now: it shows the latest words once it's there.
+            return;
+        }
+        // Built off the main thread (building a window inside an event handler
+        // can deadlock on Windows).
+        std::thread::spawn(move || {
+            let builder = WebviewWindowBuilder::new(&app, FINISH_WINDOW, WebviewUrl::App("finish.html".into()))
+                .title("SignFlow Edit")
+                .inner_size(440.0, 220.0)
+                .resizable(false)
+                .minimizable(false)
+                .maximizable(false)
+                .always_on_top(true)
+                .center()
+                .focused(true)
+                .initialization_script(format!("window.__FINISH__ = {view};"));
+            #[cfg(all(feature = "e2e", windows))]
+            let builder = builder.additional_browser_args(E2E_WEBVIEW_ARGS);
+            let built = builder.build();
+            let shared = app.state::<Shared>();
+            shared.finish_building.store(false, Ordering::SeqCst);
+            match built {
+                Ok(window) => {
+                    // Closing it is "keep waiting" (Done shows it again).
+                    window.on_window_event(|event| {
+                        if let tauri::WindowEvent::Destroyed = event {
+                            logfile::info("FINISH window closed");
+                        }
+                    });
+                    // The words may have changed (or the window been closed) while it was built.
+                    match shared.finish_view.lock().unwrap().clone() {
+                        Some(latest) if latest != view => {
+                            let _ = window.eval(format!("window.__render && window.__render({latest});"));
+                        }
+                        Some(_) => {}
+                        None => {
+                            let _ = window.close();
+                        }
+                    }
+                    logfile::info("FINISH window open");
+                }
+                Err(e) => logfile::warn(&format!("couldn't show the finish window: {e}")),
+            }
+        });
+    }
+}
+
+/// The finish window's buttons: Keep waiting, Finish without saving, or OK.
+#[tauri::command]
+fn finish_choice(app: AppHandle, window: tauri::WebviewWindow, choice: String) {
+    logfile::info(&format!("FINISH answered in the window: {choice}"));
+    match choice.as_str() {
+        "keep-waiting" => {
+            send_control(&app, Control::KeepWaiting);
+        }
+        "finish-without-saving" => {
+            send_control(&app, Control::FinishWithoutSaving);
+        }
+        _ => {}
+    }
+    let _ = window.close();
 }
 
 /// Hand the waiting session its answer, if `label` is the window it waits on.
@@ -271,6 +377,13 @@ fn start_session(app: &AppHandle, pass: String) {
             return;
         }
     }
+    open_or_queue(app, pass);
+}
+
+/// Opens the link's file — or, with an edit open, finishes that edit first
+/// when its file has been closed (next_file_while_editing).
+fn open_or_queue(app: &AppHandle, pass: String) {
+    let shared = app.state::<Shared>();
     let mut current = shared.current.lock().unwrap();
     if shared.installing.load(Ordering::SeqCst) {
         drop(current);
@@ -280,8 +393,7 @@ fn start_session(app: &AppHandle, pass: String) {
     }
     if current.is_some() {
         drop(current);
-        logfile::warn("LINK while an edit is open: asked to finish it first");
-        ui_of(app).tell(&format!("You're already editing a file. Click Done in the SignFlow Helper menu ({}), then open the other file again from SignFlow.", config::words::MENU_PLACE));
+        next_file_while_editing(app, pass);
         return;
     }
     let (tx, rx) = mpsc::channel(8);
@@ -296,6 +408,34 @@ fn start_session(app: &AppHandle, pass: String) {
     });
 }
 
+/// A link while an edit is open. Its file still open in its program: save and
+/// close it first. Closed: the open edit finishes (its last save, as Done),
+/// then the next file opens.
+fn next_file_while_editing(app: &AppHandle, pass: String) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let path = app.state::<Shared>().editing_path.lock().unwrap().clone();
+        let held = match path {
+            Some(p) => tokio::task::spawn_blocking(move || watcher::editor_holds(&p)).await.ok().flatten(),
+            None => None,
+        };
+        if held.is_some() {
+            logfile::warn("LINK while an edit is open and its file is still open: asked to save and close it first");
+            ui_of(&app).tell(session::SAVE_AND_CLOSE_FIRST);
+            return;
+        }
+        logfile::info("LINK while an edit is open and its file closed: finishing that edit, then opening the next file");
+        *app.state::<Shared>().next_pass.lock().unwrap() = Some(pass);
+        if !send_control(&app, Control::Done) {
+            // That edit ended meanwhile: open the next file now.
+            let next = app.state::<Shared>().next_pass.lock().unwrap().take();
+            if let Some(pass) = next {
+                open_or_queue(&app, pass);
+            }
+        }
+    });
+}
+
 /// The edit is over: an update waiting for it installs now; one found
 /// meanwhile is offered now (unless she said "Not now"). Quit wins over both.
 fn edit_ended(app: &AppHandle) {
@@ -303,6 +443,15 @@ fn edit_ended(app: &AppHandle) {
     let quit = *shared.quit_after_done.lock().unwrap();
     let mut current = shared.current.lock().unwrap();
     *current = None;
+    // A link that came while this edit was finishing opens now (an update
+    // waits for that edit to end, in turn).
+    let next = if quit { None } else { shared.next_pass.lock().unwrap().take() };
+    if let Some(pass) = next {
+        drop(current);
+        logfile::info("LINK the edit finished; opening the next file");
+        open_or_queue(app, pass);
+        return;
+    }
     // Decided with `current` held, so no link can start an edit in between.
     let install_now = if quit {
         None
@@ -431,7 +580,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![answer_stale, update_choice])
+        .invoke_handler(tauri::generate_handler![answer_stale, update_choice, finish_choice])
         .setup(move |app| {
             // A menu-bar app on macOS: no Dock icon, no app menu (Info.plist's
             // LSUIElement says the same from launch).
@@ -470,6 +619,10 @@ pub fn run() {
                 update_ready: Mutex::new(None),
                 installing: AtomicBool::new(false),
                 update_said: Mutex::new(String::new()),
+                editing_path: Mutex::new(None),
+                next_pass: Mutex::new(None),
+                finish_view: Mutex::new(None),
+                finish_building: AtomicBool::new(false),
             });
 
             // Did the last update take?
@@ -571,6 +724,13 @@ pub fn run() {
                         match asked.as_str() {
                             "done" => {
                                 send_control(&h, Control::Done);
+                            }
+                            // The finish window's buttons (the Mac run can't click them).
+                            "keep-waiting" => {
+                                send_control(&h, Control::KeepWaiting);
+                            }
+                            "finish-without-saving" => {
+                                send_control(&h, Control::FinishWithoutSaving);
                             }
                             // The menu's "Check for updates now", and the
                             // automatic check (which may not pop up).

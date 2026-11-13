@@ -73,6 +73,34 @@ function saveLikeMac(path, bytes) {
   renameSync(tmp, path);
 }
 const b = (s) => Buffer.from(s);
+// The app this Mac opens a file with (on the runner, Xcode for .fs): "running
+// <bundle id>", "stopped <bundle id>" or "none".
+function fsApp(path) {
+  try {
+    return run("osascript", ["-l", "JavaScript", "-e", `ObjC.import("AppKit");
+var a = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.fileURLWithPath(${JSON.stringify(path)}));
+var id = a ? ObjC.unwrap($.NSBundle.bundleWithURL(a).bundleIdentifier) : "";
+id ? ($.NSRunningApplication.runningApplicationsWithBundleIdentifier(id).count > 0 ? "running " : "stopped ") + id : "none"`]).trim();
+  } catch (e) {
+    return `unknown (${String(e.stderr ?? e.message).trim().slice(0, 80)})`;
+  }
+}
+// Closes that app, as she closes Flexi after saving (force, and waits until it's gone).
+async function quitFsApp(path) {
+  const was = fsApp(path);
+  if (!was.startsWith("running ")) return was;
+  const id = was.slice("running ".length);
+  try {
+    run("osascript", ["-l", "JavaScript", "-e", `ObjC.import("AppKit");
+var apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(${JSON.stringify(id)});
+for (var i = 0; i < apps.count; i++) apps.objectAtIndex(i).forceTerminate;
+apps.count`]);
+  } catch {}
+  await waitFor(() => !fsApp(path).startsWith("running "), 30);
+  return `${was} → ${fsApp(path)}`;
+}
+// A stand-in for an editor that keeps the file open while it's edited.
+const holdOpen = (path) => spawn("/bin/sh", ["-c", 'exec 3<>"$0"; exec sleep 600', path], { stdio: "ignore" });
 
 let standin;
 try {
@@ -192,7 +220,9 @@ try {
   check("the stale question named Dana", logHas("ASK Concept.fs by Dana"));
   rmSync(join(data, "e2e-choice.txt"), { force: true });
 
-  // ---- Done ends it; her file stays
+  // ---- Done ends it; her file stays. She has saved and closed the file's app
+  // (on the runner, Xcode): Done now waits while the file is still open in it.
+  console.log("closed the .fs app:", await quitFsApp(path));
   tell("done", "e2e-control.txt");
   const done = await waitFor(async () => { const e = await editOf(f.id); return e && !e.open ? e : null; }, 60);
   check("Done ends the edit and the lock", done?.closedReason === "done", done?.closedReason);
@@ -206,6 +236,122 @@ try {
   check("a malformed link is refused", await waitFor(() => logHas("LINK refused"), 30));
   const uploads = (await state()).events.filter((e) => e.what?.startsWith("blob"));
   check("every upload was the opened file (no .DS_Store, no ~ file)", uploads.length >= 2, `${uploads.length} uploads`);
+
+  // ---- Done before the file is saved. Flexi for Mac writes the file only
+  // when it closes, so Done on an unchanged file that's still open waits.
+  async function openFresh(name, content) {
+    const file = await admin("file", { name, content: content.toString("base64") });
+    openLink((await admin("pass", { fileId: file.id, user: "carlee" })).pass);
+    const open = await waitFor(async () => (await editOf(file.id))?.open, 60);
+    const p = await waitFor(() => {
+      for (const d of existsSync(filesDir) ? readdirSync(filesDir) : []) {
+        const q = join(filesDir, d, name);
+        if (existsSync(q)) return q;
+      }
+      return null;
+    }, 30);
+    // The runner opens .fs with an app of its own (Xcode): let it get going.
+    const app = p ? await waitFor(() => (fsApp(p).startsWith("running ") ? fsApp(p) : null), 30) : null;
+    return { file, path: p, open, app: app ?? (p ? fsApp(p) : "no file") };
+  }
+  const closedEdit = (id, seconds) => waitFor(async () => { const e = await editOf(id); return e && !e.open ? e : null; }, seconds);
+  const checkIns = async (id) => (await state()).events.filter((e) => e.what === "heartbeat" && e.fileId === id).length;
+  const replacedCount = async (id) => (await state()).events.filter((e) => e.what === "replaced" && e.fileId === id).length;
+
+  // Done after a normal save: as before, the save goes up and the edit ends.
+  const n = await openFresh("Normal.fs", b("Normal, version 1"));
+  check("normal save: the file opened", n.open && n.path, `${n.path} (${n.app})`);
+  const nv2 = b(`Normal, version 2 ${randomInt(1e9)}`);
+  saveLikeMac(n.path, nv2);
+  const quitN = await quitFsApp(n.path);
+  tell("done", "e2e-control.txt");
+  const nd = await closedEdit(n.file.id, 60);
+  check("Done after a normal save: the save reaches SignFlow", (await fileRow(n.file.id))?.sha256 === sha(nv2));
+  check("…and Done ends the edit at once, with no waiting", nd?.closedReason === "done" && !logHas("done: Normal.fs is unchanged and still open"), `${nd?.closedReason}; ${quitN}`);
+
+  // Still open in a program that holds it, unchanged: Done waits; Flexi writes
+  // the file 14 seconds later as it closes; it's uploaded and the edit ends.
+  const h = await openFresh("Held.fs", b("Held, version 1"));
+  check("held: the file opened", h.open && h.path, `${h.path} (${h.app})`);
+  const holder = holdOpen(h.path);
+  await sleep(1500);
+  const hb0 = await checkIns(h.file.id);
+  tell("done", "e2e-control.txt");
+  const doneAt = Date.now();
+  check("Done with the file unchanged and still open: it waits instead of ending", await waitFor(() => logHas("done: Held.fs is unchanged and still open"), 30), (readFileSync(log, "utf8").match(/done: Held\.fs is unchanged and still open \([^)]*\)/) ?? [""])[0]);
+  check("the window: 'Save Held.fs in Flexi and close it. SignFlow Edit will upload it when Flexi lets go.' (Keep waiting / Finish without saving)", await waitFor(() => logHas("FINISH window says: Waiting for Flexi | Save Held.fs in Flexi and close it. SignFlow Edit will upload it when Flexi lets go. | Keep waiting / Finish without saving"), 20));
+  check("the window is on screen", await waitFor(() => logHas("FINISH window open"), 30));
+  check("the menu bar says it's waiting", logHas("STATUS Waiting for Held.fs to be saved and closed in Flexi"));
+  tell("keep-waiting", "e2e-control.txt");
+  check("Keep waiting: the window closes and the edit stays open", (await waitFor(() => logHas("done: keep waiting for Held.fs"), 20)) && (await waitFor(() => logHas("FINISH window closed"), 20)) && (await editOf(h.file.id))?.open);
+  const other = await admin("file", { name: "Other.fs", content: b("Other").toString("base64") });
+  openLink((await admin("pass", { fileId: other.id, user: "carlee" })).pass);
+  check("a link while the file is still open: 'Save in Flexi and close it first, then open the next file.'", await waitFor(() => logHas("TELL Save in Flexi and close it first, then open the next file."), 30));
+  await sleep(Math.max(0, doneAt + 14_000 - Date.now()));
+  const hb1 = await checkIns(h.file.id);
+  check("while it waits the edit stays open and keeps checking in, so the lock holds", (await editOf(h.file.id))?.open && hb1 > hb0, `${hb0} → ${hb1} check-ins in ${Math.round((Date.now() - doneAt) / 1000)}s`);
+  check("nothing is uploaded while it waits", (await fileRow(h.file.id))?.sha256 === sha(b("Held, version 1")) && (await replacedCount(h.file.id)) === 0);
+  const hv2 = b(`Held, saved as Flexi closed ${randomInt(1e9)}`);
+  saveLikeMac(h.path, hv2);
+  holder.kill();
+  const quitH = await quitFsApp(h.path);
+  const hUp = await waitFor(async () => (await fileRow(h.file.id))?.sha256 === sha(hv2), 60);
+  check("14 seconds after Done the file is written and let go: it's uploaded", hUp, `written ${Math.round((Date.now() - doneAt) / 1000)}s after Done; ${quitH}`);
+  const he = await closedEdit(h.file.id, 30);
+  check("…and the edit ends on its own", he?.closedReason === "done" && logHas("session: ended: SavedAfterDone"), he?.closedReason);
+  check("it says 'Saved to SignFlow'", (await waitFor(() => logHas("FINISH window says: Saved to SignFlow | Held.fs is in SignFlow now. The edit is finished. | OK"), 20)) && logHas("STATUS Saved to SignFlow at"));
+
+  // Flexi for Mac exactly: the app keeps running, the file itself isn't held
+  // open, and it's written only as the app quits, 14 seconds after Done.
+  const a = await openFresh("AppOnly.fs", b("AppOnly, version 1"));
+  if (!a.app.startsWith("running ")) {
+    skip("the app keeps running but doesn't hold the file (Flexi for Mac): Done waits, then uploads", `the runner's .fs app isn't running (${a.app})`);
+  } else {
+    tell("done", "e2e-control.txt");
+    const t0 = Date.now();
+    const appId = a.app.slice("running ".length);
+    check(`the app keeps running but doesn't hold the file (Flexi for Mac): Done waits (${appId} is running)`, await waitFor(() => logHas(`done: AppOnly.fs is unchanged and still open (${appId} is running)`), 30));
+    await sleep(Math.max(0, t0 + 14_000 - Date.now()));
+    check("…still open, nothing uploaded, 14 seconds on", (await editOf(a.file.id))?.open && (await replacedCount(a.file.id)) === 0);
+    const av2 = b(`AppOnly, written as the app quit ${randomInt(1e9)}`);
+    saveLikeMac(a.path, av2);
+    const quitA = await quitFsApp(a.path);
+    check("…the app writes it and quits: it's uploaded", await waitFor(async () => (await fileRow(a.file.id))?.sha256 === sha(av2), 60), quitA);
+    check("…and the edit ends on its own", (await closedEdit(a.file.id, 30))?.closedReason === "done");
+  }
+
+  // Finish without saving: nothing uploaded, the edit ends.
+  const fw = await openFresh("Finish.fs", b("Finish, version 1"));
+  const fh = holdOpen(fw.path);
+  await sleep(1500);
+  tell("done", "e2e-control.txt");
+  check("Finish without saving: Done waits first", await waitFor(() => logHas("done: Finish.fs is unchanged and still open"), 30));
+  tell("finish-without-saving", "e2e-control.txt");
+  const fe = await closedEdit(fw.file.id, 30);
+  check("Finish without saving ends the edit…", fe?.closedReason === "done" && logHas("done: finish without saving Finish.fs"), fe?.closedReason);
+  check("…with nothing uploaded", (await fileRow(fw.file.id))?.sha256 === sha(b("Finish, version 1")) && (await replacedCount(fw.file.id)) === 0);
+  fh.kill();
+  await quitFsApp(fw.path);
+
+  // The next file, once the open one is saved and closed: that edit finishes, the next opens.
+  const first = await openFresh("First.fs", b("First"));
+  const quitF = await quitFsApp(first.path);
+  await sleep(1500);
+  const second = await admin("file", { name: "Second.fs", content: b("Second").toString("base64") });
+  openLink((await admin("pass", { fileId: second.id, user: "carlee" })).pass);
+  const fc = await closedEdit(first.file.id, 60);
+  check("a link once the open file is closed: that edit finishes…", fc?.closedReason === "done" && logHas("LINK while an edit is open and its file closed"), `${fc?.closedReason}; ${quitF}`);
+  check("…and the next file opens", await waitFor(async () => (await editOf(second.id))?.open, 60));
+  const secondPath = await waitFor(() => {
+    for (const d of existsSync(filesDir) ? readdirSync(filesDir) : []) {
+      const q = join(filesDir, d, "Second.fs");
+      if (existsSync(q)) return q;
+    }
+    return null;
+  }, 30);
+  if (secondPath) await quitFsApp(secondPath);
+  tell("done", "e2e-control.txt");
+  check("…and its Done ends it", (await closedEdit(second.id, 60))?.closedReason === "done");
 } catch (e) {
   check("the run stopped early", false, `${e.message}${e.body ? " " + JSON.stringify(e.body) : ""}`);
 } finally {

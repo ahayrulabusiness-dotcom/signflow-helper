@@ -89,6 +89,21 @@ function saveLikeMac(path, bytes) {
   renameSync(tmp, path);
 }
 const b = (s) => Buffer.from(s);
+// Closes the app this Mac opens the file with (on the runner, Xcode for .fs),
+// as she closes Flexi after saving: Done waits while the file is still open in
+// it. Force, and waits until it's gone.
+async function quitFsApp(path) {
+  const jxa = (body) => tryRun("osascript", ["-l", "JavaScript", "-e", `ObjC.import("AppKit");
+var a = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.fileURLWithPath(${JSON.stringify(path ?? "/nonexistent.fs")}));
+var id = a ? ObjC.unwrap($.NSBundle.bundleWithURL(a).bundleIdentifier) : "";
+var apps = id ? $.NSRunningApplication.runningApplicationsWithBundleIdentifier(id) : null;
+${body}`]);
+  const was = jxa('(apps && apps.count > 0 ? "running " : "not running ") + id');
+  if (!was.startsWith("running ")) return was;
+  jxa("for (var i = 0; i < apps.count; i++) apps.objectAtIndex(i).forceTerminate; apps.count");
+  await waitFor(() => !jxa('(apps && apps.count > 0 ? "running " : "not running ") + id').startsWith("running "), 30);
+  return `${was} → closed`;
+}
 function herFiles() {
   const all = {};
   const walk = (d) => {
@@ -240,6 +255,7 @@ try {
   const mineU = b(`Update file, saved while the update waits ${randomInt(1e9)}`);
   if (uPath) saveLikeMac(uPath, mineU);
   check("editing goes on as normal: a save reaches SignFlow while the update waits", await waitFor(async () => (await fileRow(uf.id))?.sha256 === sha(mineU), 60));
+  console.log("closed the .fs app:", await quitFsApp(uPath));
   await control("done");
   check("Done ends the edit", await waitFor(async () => (await editOf(uf.id))?.open === false, 60));
   check("…then it installs", (await waitLog("UPDATE the edit ended; installing now", 30)) && (await waitLog(`UPDATE installing ${next} (from ${current})`, 30)));
@@ -284,6 +300,7 @@ try {
   // If not, say why: what the helper logged about it, and who holds the file open.
   const why = uploadedA ? "" : `${logText().slice(afterMark).split("\n").filter((l) => /After\.fs|save|STATUS|watch|session/.test(l)).slice(-10).join(" / ")} / lsof: ${aPath ? tryRun("/usr/sbin/lsof", ["--", aPath]).replace(/\s+/g, " ").slice(0, 400) : "-"}`;
   check(`${next}: a save is uploaded as the new version`, uploadedA, why);
+  console.log("closed the .fs app:", await quitFsApp(aPath));
   await control("done");
   check(`${next}: Done ends the edit`, await waitFor(async () => (await editOf(af.id))?.open === false, 60));
 
